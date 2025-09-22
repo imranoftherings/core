@@ -1,4 +1,5 @@
 """The tests for the uk_transport platform."""
+
 import re
 from unittest.mock import patch
 
@@ -7,6 +8,7 @@ import requests_mock
 from homeassistant.components.uk_transport.sensor import (
     ATTR_ATCOCODE,
     ATTR_CALLING_AT,
+    ATTR_LAST_UPDATED,
     ATTR_LOCALITY,
     ATTR_NEXT_BUSES,
     ATTR_NEXT_TRAINS,
@@ -16,10 +18,11 @@ from homeassistant.components.uk_transport.sensor import (
     CONF_API_APP_KEY,
     UkTransportSensor,
 )
+from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util.dt import now
 
-from tests.common import load_fixture
+from tests.common import async_load_fixture
 
 BUS_ATCOCODE = "340000368SHE"
 BUS_DIRECTION = "Wantage"
@@ -43,21 +46,21 @@ VALID_CONFIG = {
 }
 
 
-async def test_bus(hass):
+async def test_bus(hass: HomeAssistant) -> None:
     """Test for operational uk_transport sensor with proper attributes."""
     with requests_mock.Mocker() as mock_req:
         uri = re.compile(UkTransportSensor.TRANSPORT_API_URL_BASE + "*")
-        mock_req.get(uri, text=load_fixture("uk_transport_bus.json"))
+        mock_req.get(uri, text=await async_load_fixture(hass, "uk_transport/bus.json"))
         assert await async_setup_component(hass, "sensor", VALID_CONFIG)
         await hass.async_block_till_done()
 
     bus_state = hass.states.get("sensor.next_bus_to_wantage")
     assert None is not bus_state
-    assert f"Next bus to {BUS_DIRECTION}" == bus_state.name
-    assert BUS_ATCOCODE == bus_state.attributes[ATTR_ATCOCODE]
-    assert "Harwell Campus" == bus_state.attributes[ATTR_LOCALITY]
-    assert "Bus Station" == bus_state.attributes[ATTR_STOP_NAME]
-    assert 2 == len(bus_state.attributes.get(ATTR_NEXT_BUSES))
+    assert bus_state.name == f"Next bus to {BUS_DIRECTION}"
+    assert bus_state.attributes[ATTR_ATCOCODE] == BUS_ATCOCODE
+    assert bus_state.attributes[ATTR_LOCALITY] == "Harwell Campus"
+    assert bus_state.attributes[ATTR_STOP_NAME] == "Bus Station"
+    assert len(bus_state.attributes.get(ATTR_NEXT_BUSES)) == 2
 
     direction_re = re.compile(BUS_DIRECTION)
     for bus in bus_state.attributes.get(ATTR_NEXT_BUSES):
@@ -65,25 +68,29 @@ async def test_bus(hass):
         assert None is not direction_re.search(bus["direction"])
 
 
-async def test_train(hass):
+async def test_train(hass: HomeAssistant) -> None:
     """Test for operational uk_transport sensor with proper attributes."""
-    with requests_mock.Mocker() as mock_req, patch(
-        "homeassistant.util.dt.now", return_value=now().replace(hour=13)
+    with (
+        requests_mock.Mocker() as mock_req,
+        patch("homeassistant.util.dt.now", return_value=now().replace(hour=13)),
     ):
         uri = re.compile(UkTransportSensor.TRANSPORT_API_URL_BASE + "*")
-        mock_req.get(uri, text=load_fixture("uk_transport_train.json"))
+        mock_req.get(
+            uri, text=await async_load_fixture(hass, "uk_transport/train.json")
+        )
         assert await async_setup_component(hass, "sensor", VALID_CONFIG)
         await hass.async_block_till_done()
 
     train_state = hass.states.get("sensor.next_train_to_WAT")
     assert None is not train_state
-    assert f"Next train to {TRAIN_DESTINATION_NAME}" == train_state.name
-    assert TRAIN_STATION_CODE == train_state.attributes[ATTR_STATION_CODE]
-    assert TRAIN_DESTINATION_NAME == train_state.attributes[ATTR_CALLING_AT]
-    assert 25 == len(train_state.attributes.get(ATTR_NEXT_TRAINS))
+    assert train_state.name == f"Next train to {TRAIN_DESTINATION_NAME}"
+    assert train_state.attributes[ATTR_STATION_CODE] == TRAIN_STATION_CODE
+    assert train_state.attributes[ATTR_CALLING_AT] == TRAIN_DESTINATION_NAME
+    assert len(train_state.attributes.get(ATTR_NEXT_TRAINS)) == 25
 
     assert (
-        "London Waterloo"
-        == train_state.attributes[ATTR_NEXT_TRAINS][0]["destination_name"]
+        train_state.attributes[ATTR_NEXT_TRAINS][0]["destination_name"]
+        == "London Waterloo"
     )
-    assert "06:13" == train_state.attributes[ATTR_NEXT_TRAINS][0]["estimated"]
+    assert train_state.attributes[ATTR_NEXT_TRAINS][0]["estimated"] == "06:13"
+    assert train_state.attributes[ATTR_LAST_UPDATED] == "2017-07-10T06:10:05+01:00"

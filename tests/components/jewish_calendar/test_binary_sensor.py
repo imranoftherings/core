@@ -1,130 +1,139 @@
 """The tests for the Jewish calendar binary sensors."""
-from datetime import datetime as dt, timedelta
 
+from datetime import datetime as dt, timedelta
+from typing import Any
+
+from freezegun.api import FrozenDateTimeFactory
 import pytest
 
-from homeassistant.components import jewish_calendar
 from homeassistant.const import STATE_OFF, STATE_ON
-from homeassistant.setup import async_setup_component
-import homeassistant.util.dt as dt_util
-
-from . import (
-    HDATE_DEFAULT_ALTITUDE,
-    alter_time,
-    make_jerusalem_test_params,
-    make_nyc_test_params,
-)
+from homeassistant.core import HomeAssistant
 
 from tests.common import async_fire_time_changed
 
 MELACHA_PARAMS = [
-    make_nyc_test_params(dt(2018, 9, 1, 16, 0), STATE_ON),
-    make_nyc_test_params(dt(2018, 9, 1, 20, 21), STATE_OFF),
-    make_nyc_test_params(dt(2018, 9, 7, 13, 1), STATE_OFF),
-    make_nyc_test_params(dt(2018, 9, 8, 21, 25), STATE_OFF),
-    make_nyc_test_params(dt(2018, 9, 9, 21, 25), STATE_ON),
-    make_nyc_test_params(dt(2018, 9, 10, 21, 25), STATE_ON),
-    make_nyc_test_params(dt(2018, 9, 28, 21, 25), STATE_ON),
-    make_nyc_test_params(dt(2018, 9, 29, 21, 25), STATE_OFF),
-    make_nyc_test_params(dt(2018, 9, 30, 21, 25), STATE_ON),
-    make_nyc_test_params(dt(2018, 10, 1, 21, 25), STATE_ON),
-    make_jerusalem_test_params(dt(2018, 9, 29, 21, 25), STATE_OFF),
-    make_jerusalem_test_params(dt(2018, 9, 30, 21, 25), STATE_ON),
-    make_jerusalem_test_params(dt(2018, 10, 1, 21, 25), STATE_OFF),
-]
-
-MELACHA_TEST_IDS = [
-    "currently_first_shabbat",
-    "after_first_shabbat",
-    "friday_upcoming_shabbat",
-    "upcoming_rosh_hashana",
-    "currently_rosh_hashana",
-    "second_day_rosh_hashana",
-    "currently_shabbat_chol_hamoed",
-    "upcoming_two_day_yomtov_in_diaspora",
-    "currently_first_day_of_two_day_yomtov_in_diaspora",
-    "currently_second_day_of_two_day_yomtov_in_diaspora",
-    "upcoming_one_day_yom_tov_in_israel",
-    "currently_one_day_yom_tov_in_israel",
-    "after_one_day_yom_tov_in_israel",
+    pytest.param(
+        "New York",
+        dt(2018, 9, 1, 16, 0),
+        {"state": STATE_ON, "update": dt(2018, 9, 1, 20, 14), "new_state": STATE_OFF},
+        id="currently_first_shabbat",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 1, 20, 21),
+        {"state": STATE_OFF, "update": dt(2018, 9, 2, 6, 21), "new_state": STATE_OFF},
+        id="after_first_shabbat",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 7, 13, 1),
+        {"state": STATE_OFF, "update": dt(2018, 9, 7, 19, 4), "new_state": STATE_ON},
+        id="friday_upcoming_shabbat",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 8, 21, 25),
+        {"state": STATE_OFF, "update": dt(2018, 9, 9, 6, 27), "new_state": STATE_OFF},
+        id="upcoming_rosh_hashana",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 9, 21, 25),
+        {"state": STATE_ON, "update": dt(2018, 9, 10, 6, 28), "new_state": STATE_ON},
+        id="currently_rosh_hashana",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 10, 21, 25),
+        {"state": STATE_ON, "update": dt(2018, 9, 11, 6, 29), "new_state": STATE_ON},
+        id="second_day_rosh_hashana_night",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 11, 11, 25),
+        {"state": STATE_ON, "update": dt(2018, 9, 11, 19, 57), "new_state": STATE_OFF},
+        id="second_day_rosh_hashana_day",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 29, 16, 25),
+        {"state": STATE_ON, "update": dt(2018, 9, 29, 19, 25), "new_state": STATE_OFF},
+        id="currently_shabbat_chol_hamoed",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 29, 21, 25),
+        {"state": STATE_OFF, "update": dt(2018, 9, 30, 6, 48), "new_state": STATE_OFF},
+        id="upcoming_two_day_yomtov_in_diaspora",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 9, 30, 21, 25),
+        {"state": STATE_ON, "update": dt(2018, 10, 1, 6, 49), "new_state": STATE_ON},
+        id="currently_first_day_of_two_day_yomtov_in_diaspora",
+    ),
+    pytest.param(
+        "New York",
+        dt(2018, 10, 1, 21, 25),
+        {"state": STATE_ON, "update": dt(2018, 10, 2, 6, 50), "new_state": STATE_ON},
+        id="currently_second_day_of_two_day_yomtov_in_diaspora",
+    ),
+    pytest.param(
+        "Jerusalem",
+        dt(2018, 9, 29, 21, 25),
+        {"state": STATE_OFF, "update": dt(2018, 9, 30, 6, 29), "new_state": STATE_OFF},
+        id="upcoming_one_day_yom_tov_in_israel",
+    ),
+    pytest.param(
+        "Jerusalem",
+        dt(2018, 10, 1, 11, 25),
+        {"state": STATE_ON, "update": dt(2018, 10, 1, 19, 2), "new_state": STATE_OFF},
+        id="currently_one_day_yom_tov_in_israel",
+    ),
+    pytest.param(
+        "Jerusalem",
+        dt(2018, 10, 1, 21, 25),
+        {"state": STATE_OFF, "update": dt(2018, 10, 2, 6, 31), "new_state": STATE_OFF},
+        id="after_one_day_yom_tov_in_israel",
+    ),
 ]
 
 
 @pytest.mark.parametrize(
-    [
-        "now",
-        "candle_lighting",
-        "havdalah",
-        "diaspora",
-        "tzname",
-        "latitude",
-        "longitude",
-        "result",
-    ],
-    MELACHA_PARAMS,
-    ids=MELACHA_TEST_IDS,
+    ("location_data", "test_time", "results"), MELACHA_PARAMS, indirect=True
 )
+@pytest.mark.usefixtures("setup_at_time")
 async def test_issur_melacha_sensor(
-    hass,
-    legacy_patchable_time,
-    now,
-    candle_lighting,
-    havdalah,
-    diaspora,
-    tzname,
-    latitude,
-    longitude,
-    result,
-):
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, results: dict[str, Any]
+) -> None:
     """Test Issur Melacha sensor output."""
-    time_zone = dt_util.get_time_zone(tzname)
-    test_time = time_zone.localize(now)
+    sensor_id = "binary_sensor.jewish_calendar_issur_melacha_in_effect"
+    assert hass.states.get(sensor_id).state == results["state"]
 
-    hass.config.time_zone = time_zone
-    hass.config.latitude = latitude
-    hass.config.longitude = longitude
+    freezer.move_to(results["update"])
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert hass.states.get(sensor_id).state == results["new_state"]
 
-    registry = await hass.helpers.entity_registry.async_get_registry()
 
-    with alter_time(test_time):
-        assert await async_setup_component(
-            hass,
-            jewish_calendar.DOMAIN,
-            {
-                "jewish_calendar": {
-                    "name": "test",
-                    "language": "english",
-                    "diaspora": diaspora,
-                    "candle_lighting_minutes_before_sunset": candle_lighting,
-                    "havdalah_minutes_after_sunset": havdalah,
-                }
-            },
-        )
-        await hass.async_block_till_done()
+@pytest.mark.parametrize(
+    ("location_data", "test_time", "results"),
+    [
+        ("New York", dt(2020, 10, 23, 17, 44, 59, 999999), [STATE_OFF, STATE_ON]),
+        ("New York", dt(2020, 10, 24, 18, 42, 59, 999999), [STATE_ON, STATE_OFF]),
+    ],
+    ids=["before_candle_lighting", "before_havdalah"],
+    indirect=True,
+)
+@pytest.mark.usefixtures("setup_at_time")
+async def test_issur_melacha_sensor_update(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory, results: list[str]
+) -> None:
+    """Test Issur Melacha sensor output."""
+    sensor_id = "binary_sensor.jewish_calendar_issur_melacha_in_effect"
+    assert hass.states.get(sensor_id).state == results[0]
 
-        future = dt_util.utcnow() + timedelta(seconds=30)
-        async_fire_time_changed(hass, future)
-        await hass.async_block_till_done()
-
-        assert (
-            hass.states.get("binary_sensor.test_issur_melacha_in_effect").state
-            == result
-        )
-        entity = registry.async_get("binary_sensor.test_issur_melacha_in_effect")
-        target_uid = "_".join(
-            map(
-                str,
-                [
-                    latitude,
-                    longitude,
-                    time_zone,
-                    HDATE_DEFAULT_ALTITUDE,
-                    diaspora,
-                    "english",
-                    candle_lighting,
-                    havdalah,
-                    "issur_melacha_in_effect",
-                ],
-            )
-        )
-        assert entity.unique_id == target_uid
+    freezer.tick(timedelta(microseconds=1))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done()
+    assert hass.states.get(sensor_id).state == results[1]

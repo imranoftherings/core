@@ -1,48 +1,59 @@
 """The 1-Wire component."""
-import asyncio
 
-from homeassistant.config_entries import ConfigEntry
+import logging
+
+from pyownet import protocol
+
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.helpers import device_registry as dr
 
-from .const import DOMAIN, SUPPORTED_PLATFORMS
-from .onewirehub import CannotConnect, OneWireHub
+from .const import DOMAIN
+from .onewirehub import OneWireConfigEntry, OneWireHub
+
+_LOGGER = logging.getLogger(__name__)
+
+_PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 
-async def async_setup(hass, config):
-    """Set up 1-Wire integrations."""
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistantType, config_entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: OneWireConfigEntry) -> bool:
     """Set up a 1-Wire proxy for a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
-    onewirehub = OneWireHub(hass)
+    onewire_hub = OneWireHub(hass, entry)
     try:
-        await onewirehub.initialize(config_entry)
-    except CannotConnect as exc:
-        raise ConfigEntryNotReady() from exc
+        await onewire_hub.initialize()
+    except (
+        protocol.ConnError,  # Failed to connect to the server
+        protocol.OwnetError,  # Connected to server, but failed to list the devices
+    ) as exc:
+        raise ConfigEntryNotReady from exc
 
-    hass.data[DOMAIN][config_entry.unique_id] = onewirehub
+    entry.runtime_data = onewire_hub
 
-    for component in SUPPORTED_PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(config_entry, component)
-        )
+    await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
+
+    onewire_hub.schedule_scan_for_new_devices()
+
     return True
 
 
-async def async_unload_entry(hass: HomeAssistantType, config_entry: ConfigEntry):
-    """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(config_entry, component)
-                for component in SUPPORTED_PLATFORMS
-            ]
-        )
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: OneWireConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    onewire_hub = config_entry.runtime_data
+    return not device_entry.identifiers.intersection(
+        (DOMAIN, device.id) for device in onewire_hub.devices or []
     )
-    if unload_ok:
-        hass.data[DOMAIN].pop(config_entry.unique_id)
-    return unload_ok
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: OneWireConfigEntry
+) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(config_entry, _PLATFORMS)

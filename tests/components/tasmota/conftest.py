@@ -1,41 +1,19 @@
 """Test fixtures for Tasmota component."""
+
 from unittest.mock import patch
 
 from hatasmota.discovery import get_status_sensor_entities
 import pytest
 
-from homeassistant import config_entries
 from homeassistant.components.tasmota.const import (
     CONF_DISCOVERY_PREFIX,
     DEFAULT_PREFIX,
     DOMAIN,
 )
+from homeassistant.core import HomeAssistant
 
-from tests.common import (
-    MockConfigEntry,
-    async_mock_service,
-    mock_device_registry,
-    mock_registry,
-)
-from tests.components.light.conftest import mock_light_profiles  # noqa
-
-
-@pytest.fixture
-def device_reg(hass):
-    """Return an empty, loaded, registry."""
-    return mock_device_registry(hass)
-
-
-@pytest.fixture
-def entity_reg(hass):
-    """Return an empty, loaded, registry."""
-    return mock_registry(hass)
-
-
-@pytest.fixture
-def calls(hass):
-    """Track calls to a mock service."""
-    return async_mock_service(hass, "test", "automation")
+from tests.common import MockConfigEntry
+from tests.components.light.conftest import mock_light_profiles  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -59,12 +37,11 @@ def disable_status_sensor(status_sensor_disabled):
         yield
 
 
-async def setup_tasmota_helper(hass):
+async def setup_tasmota_helper(hass: HomeAssistant) -> None:
     """Set up Tasmota."""
     hass.config.components.add("tasmota")
 
     entry = MockConfigEntry(
-        connection_class=config_entries.CONN_CLASS_LOCAL_PUSH,
         data={CONF_DISCOVERY_PREFIX: DEFAULT_PREFIX},
         domain=DOMAIN,
         title="Tasmota",
@@ -79,6 +56,6 @@ async def setup_tasmota_helper(hass):
 
 
 @pytest.fixture
-async def setup_tasmota(hass):
+async def setup_tasmota(hass: HomeAssistant) -> None:
     """Set up Tasmota."""
     await setup_tasmota_helper(hass)

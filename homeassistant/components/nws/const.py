@@ -1,4 +1,10 @@
 """Constants for National Weather Service Integration."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Final
+
 from homeassistant.components.weather import (
     ATTR_CONDITION_CLOUDY,
     ATTR_CONDITION_EXCEPTIONAL,
@@ -21,10 +27,10 @@ CONF_STATION = "station"
 
 ATTRIBUTION = "Data from National Weather Service/NOAA"
 
-ATTR_FORECAST_DETAILED_DESCRIPTION = "detailed_description"
-ATTR_FORECAST_DAYTIME = "daytime"
+ATTR_FORECAST_SHORT_DESCRIPTION: Final = "short_description"
+ATTR_FORECAST_DETAILED_DESCRIPTION: Final = "detailed_description"
 
-CONDITION_CLASSES = {
+CONDITION_CLASSES: dict[str, list[str]] = {
     ATTR_CONDITION_EXCEPTIONAL: [
         "Tornado",
         "Hurricane conditions",
@@ -35,7 +41,7 @@ CONDITION_CLASSES = {
         "Hot",
         "Cold",
     ],
-    ATTR_CONDITION_SNOWY: ["Snow", "Sleet", "Blizzard"],
+    ATTR_CONDITION_SNOWY: ["Snow", "Sleet", "Snow/sleet", "Blizzard"],
     ATTR_CONDITION_SNOWY_RAINY: [
         "Rain/snow",
         "Rain/sleet",
@@ -71,7 +77,12 @@ CONDITION_CLASSES = {
 DAYNIGHT = "daynight"
 HOURLY = "hourly"
 
-NWS_DATA = "nws data"
-COORDINATOR_OBSERVATION = "coordinator_observation"
-COORDINATOR_FORECAST = "coordinator_forecast"
-COORDINATOR_FORECAST_HOURLY = "coordinator_forecast_hourly"
+OBSERVATION_VALID_TIME = timedelta(minutes=60)
+FORECAST_VALID_TIME = timedelta(minutes=45)
+# Ask for observations for last four hours
+UPDATE_TIME_PERIOD = timedelta(minutes=240)
+
+DEBOUNCE_TIME = 10 * 60  # in seconds
+DEFAULT_SCAN_INTERVAL = timedelta(minutes=10)
+RETRY_INTERVAL = timedelta(minutes=1)
+RETRY_STOP = timedelta(minutes=10)

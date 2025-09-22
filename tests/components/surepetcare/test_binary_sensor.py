@@ -1,33 +1,34 @@
 """The tests for the Sure Petcare binary sensor platform."""
-from surepy import MESTART_RESOURCE
 
-from homeassistant.components.surepetcare.const import DOMAIN
-from homeassistant.setup import async_setup_component
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from . import MOCK_API_DATA, MOCK_CONFIG, _patch_sensor_setup
+from . import HOUSEHOLD_ID, HUB_ID
+
+from tests.common import MockConfigEntry
 
 EXPECTED_ENTITY_IDS = {
-    "binary_sensor.pet_flap_pet_flap_connectivity": "household-id-13576-connectivity",
-    "binary_sensor.pet_flap_cat_flap_connectivity": "household-id-13579-connectivity",
-    "binary_sensor.feeder_feeder_connectivity": "household-id-12345-connectivity",
-    "binary_sensor.pet_pet": "household-id-24680",
-    "binary_sensor.hub_hub": "household-id-hub-id",
+    "binary_sensor.pet_flap_connectivity": f"{HOUSEHOLD_ID}-13576-connectivity",
+    "binary_sensor.cat_flap_connectivity": f"{HOUSEHOLD_ID}-13579-connectivity",
+    "binary_sensor.feeder_connectivity": f"{HOUSEHOLD_ID}-12345-connectivity",
+    "binary_sensor.pet": f"{HOUSEHOLD_ID}-24680",
+    "binary_sensor.hub": f"{HOUSEHOLD_ID}-{HUB_ID}",
 }
 
 
-async def test_binary_sensors(hass, surepetcare) -> None:
+async def test_binary_sensors(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    surepetcare,
+    mock_config_entry_setup: MockConfigEntry,
+) -> None:
     """Test the generation of unique ids."""
-    instance = surepetcare.return_value
-    instance._resource[MESTART_RESOURCE] = {"data": MOCK_API_DATA}
-
-    with _patch_sensor_setup():
-        assert await async_setup_component(hass, DOMAIN, MOCK_CONFIG)
-        await hass.async_block_till_done()
-
-    entity_registry = await hass.helpers.entity_registry.async_get_registry()
     state_entity_ids = hass.states.async_entity_ids()
 
     for entity_id, unique_id in EXPECTED_ENTITY_IDS.items():
         assert entity_id in state_entity_ids
+        state = hass.states.get(entity_id)
+        assert state
+        assert state.state == "on"
         entity = entity_registry.async_get(entity_id)
         assert entity.unique_id == unique_id

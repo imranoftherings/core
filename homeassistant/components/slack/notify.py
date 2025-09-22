@@ -1,43 +1,48 @@
 """Slack platform for notify component."""
+
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
+from typing import Any, TypedDict, cast
 from urllib.parse import urlparse
 
-from aiohttp import BasicAuth, FormData
+from aiohttp import BasicAuth
 from aiohttp.client_exceptions import ClientError
-from slack import WebClient
-from slack.errors import SlackApiError
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_client import AsyncWebClient
 import voluptuous as vol
 
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TARGET,
     ATTR_TITLE,
-    PLATFORM_SCHEMA,
     BaseNotificationService,
 )
-from homeassistant.const import CONF_API_KEY, CONF_ICON, CONF_USERNAME
-from homeassistant.core import callback
-from homeassistant.helpers import aiohttp_client, config_validation as cv
-import homeassistant.helpers.template as template
+from homeassistant.const import ATTR_ICON, CONF_PATH
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import aiohttp_client, config_validation as cv, template
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from .const import (
+    ATTR_BLOCKS,
+    ATTR_BLOCKS_TEMPLATE,
+    ATTR_FILE,
+    ATTR_PASSWORD,
+    ATTR_PATH,
+    ATTR_THREAD_TS,
+    ATTR_URL,
+    ATTR_USERNAME,
+    CONF_DEFAULT_CHANNEL,
+    DATA_CLIENT,
+    SLACK_DATA,
+)
+from .utils import upload_file_to_slack
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_BLOCKS = "blocks"
-ATTR_BLOCKS_TEMPLATE = "blocks_template"
-ATTR_FILE = "file"
-ATTR_ICON = "icon"
-ATTR_PASSWORD = "password"
-ATTR_PATH = "path"
-ATTR_URL = "url"
-ATTR_USERNAME = "username"
-
-CONF_DEFAULT_CHANNEL = "default_channel"
-
-DEFAULT_TIMEOUT_SECONDS = 15
-
-FILE_PATH_SCHEMA = vol.Schema({vol.Required(ATTR_PATH): cv.isfile})
+FILE_PATH_SCHEMA = vol.Schema({vol.Required(CONF_PATH): cv.isfile})
 
 FILE_URL_SCHEMA = vol.Schema(
     {
@@ -48,7 +53,10 @@ FILE_URL_SCHEMA = vol.Schema(
 )
 
 DATA_FILE_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_FILE): vol.Any(FILE_PATH_SCHEMA, FILE_URL_SCHEMA)}
+    {
+        vol.Required(ATTR_FILE): vol.Any(FILE_PATH_SCHEMA, FILE_URL_SCHEMA),
+        vol.Optional(ATTR_THREAD_TS): cv.string,
+    }
 )
 
 DATA_TEXT_ONLY_SCHEMA = vol.Schema(
@@ -57,6 +65,7 @@ DATA_TEXT_ONLY_SCHEMA = vol.Schema(
         vol.Optional(ATTR_ICON): cv.string,
         vol.Optional(ATTR_BLOCKS): list,
         vol.Optional(ATTR_BLOCKS_TEMPLATE): list,
+        vol.Optional(ATTR_THREAD_TS): cv.string,
     }
 )
 
@@ -64,75 +73,86 @@ DATA_SCHEMA = vol.All(
     cv.ensure_list, [vol.Any(DATA_FILE_SCHEMA, DATA_TEXT_ONLY_SCHEMA)]
 )
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Required(CONF_DEFAULT_CHANNEL): cv.string,
-        vol.Optional(CONF_ICON): cv.string,
-        vol.Optional(CONF_USERNAME): cv.string,
-    }
-)
+
+class AuthDictT(TypedDict, total=False):
+    """Type for auth request data."""
+
+    auth: BasicAuth
 
 
-async def async_get_service(hass, config, discovery_info=None):
+class FormDataT(TypedDict, total=False):
+    """Type for form data, file upload."""
+
+    channels: str
+    filename: str
+    initial_comment: str
+    title: str
+    token: str
+    thread_ts: str  # Optional key
+
+
+class MessageT(TypedDict, total=False):
+    """Type for message data."""
+
+    link_names: bool
+    text: str
+    username: str  # Optional key
+    icon_url: str  # Optional key
+    icon_emoji: str  # Optional key
+    blocks: list[Any]  # Optional key
+    thread_ts: str  # Optional key
+
+
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> SlackNotificationService | None:
     """Set up the Slack notification service."""
-    session = aiohttp_client.async_get_clientsession(hass)
-    client = WebClient(token=config[CONF_API_KEY], run_async=True, session=session)
-
-    try:
-        await client.auth_test()
-    except SlackApiError as err:
-        _LOGGER.error("Error while setting up integration: %s", err)
-        return
-
-    return SlackNotificationService(
-        hass,
-        client,
-        config[CONF_DEFAULT_CHANNEL],
-        username=config.get(CONF_USERNAME),
-        icon=config.get(CONF_ICON),
-    )
+    if discovery_info:
+        return SlackNotificationService(
+            hass,
+            discovery_info[SLACK_DATA][DATA_CLIENT],
+            discovery_info,
+        )
+    return None
 
 
 @callback
-def _async_get_filename_from_url(url):
+def _async_get_filename_from_url(url: str) -> str:
     """Return the filename of a passed URL."""
     parsed_url = urlparse(url)
     return os.path.basename(parsed_url.path)
 
 
 @callback
-def _async_sanitize_channel_names(channel_list):
+def _async_sanitize_channel_names(channel_list: list[str]) -> list[str]:
     """Remove any # symbols from a channel list."""
     return [channel.lstrip("#") for channel in channel_list]
-
-
-@callback
-def _async_templatize_blocks(hass, value):
-    """Recursive template creator helper function."""
-    if isinstance(value, list):
-        return [_async_templatize_blocks(hass, item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _async_templatize_blocks(hass, item) for key, item in value.items()
-        }
-
-    tmpl = template.Template(value, hass=hass)
-    return tmpl.async_render(parse_result=False)
 
 
 class SlackNotificationService(BaseNotificationService):
     """Define the Slack notification logic."""
 
-    def __init__(self, hass, client, default_channel, username, icon):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        client: AsyncWebClient,
+        config: dict[str, str],
+    ) -> None:
         """Initialize."""
-        self._client = client
-        self._default_channel = default_channel
         self._hass = hass
-        self._icon = icon
-        self._username = username
+        self._client = client
+        self._config = config
 
-    async def _async_send_local_file_message(self, path, targets, message, title):
+    async def _async_send_local_file_message(
+        self,
+        path: str,
+        targets: list[str],
+        message: str,
+        title: str | None,
+        thread_ts: str | None,
+    ) -> None:
         """Upload a local file (with message) to Slack."""
         if not self._hass.config.is_allowed_path(path):
             _LOGGER.error("Path does not exist or is not allowed: %s", path)
@@ -141,88 +161,101 @@ class SlackNotificationService(BaseNotificationService):
         parsed_url = urlparse(path)
         filename = os.path.basename(parsed_url.path)
 
-        try:
-            await self._client.files_upload(
-                channels=",".join(targets),
-                file=path,
-                filename=filename,
-                initial_comment=message,
-                title=title or filename,
-            )
-        except SlackApiError as err:
-            _LOGGER.error("Error while uploading file-based message: %s", err)
+        channel_ids = [await self._async_get_channel_id(target) for target in targets]
+        channel_ids = [cid for cid in channel_ids if cid]  # Remove None values
+
+        if not channel_ids:
+            _LOGGER.error("No valid channel IDs resolved for targets: %s", targets)
+            return
+
+        await upload_file_to_slack(
+            client=self._client,
+            channel_ids=channel_ids,
+            file_content=None,
+            file_path=path,
+            filename=filename,
+            title=title,
+            message=message,
+            thread_ts=thread_ts,
+        )
 
     async def _async_send_remote_file_message(
-        self, url, targets, message, title, *, username=None, password=None
-    ):
-        """Upload a remote file (with message) to Slack.
-
-        Note that we bypass the python-slackclient WebClient and use aiohttp directly,
-        as the former would require us to download the entire remote file into memory
-        first before uploading it to Slack.
-        """
+        self,
+        url: str,
+        targets: list[str],
+        message: str,
+        title: str | None,
+        thread_ts: str | None,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        """Upload a remote file (with message) to Slack."""
         if not self._hass.config.is_allowed_external_url(url):
             _LOGGER.error("URL is not allowed: %s", url)
             return
 
         filename = _async_get_filename_from_url(url)
-        session = aiohttp_client.async_get_clientsession(self.hass)
+        session = aiohttp_client.async_get_clientsession(self._hass)
 
-        kwargs = {}
-        if username and password is not None:
+        # Fetch the remote file
+        kwargs: AuthDictT = {}
+        if username and password:
             kwargs = {"auth": BasicAuth(username, password=password)}
 
-        resp = await session.request("get", url, **kwargs)
-
         try:
-            resp.raise_for_status()
+            async with session.get(url, **kwargs) as resp:
+                resp.raise_for_status()
+                file_content = await resp.read()
         except ClientError as err:
-            _LOGGER.error("Error while retrieving %s: %s", url, err)
+            _LOGGER.error("Error while retrieving %s: %r", url, err)
             return
 
-        data = FormData(
-            {
-                "channels": ",".join(targets),
-                "filename": filename,
-                "initial_comment": message,
-                "title": title or filename,
-                "token": self._client.token,
-            },
-            charset="utf-8",
-        )
-        data.add_field("file", resp.content, filename=filename)
+        channel_ids = [await self._async_get_channel_id(target) for target in targets]
+        channel_ids = [cid for cid in channel_ids if cid]  # Remove None values
 
-        try:
-            await session.post("https://slack.com/api/files.upload", data=data)
-        except ClientError as err:
-            _LOGGER.error("Error while uploading file message: %s", err)
+        if not channel_ids:
+            _LOGGER.error("No valid channel IDs resolved for targets: %s", targets)
+            return
+
+        await upload_file_to_slack(
+            client=self._client,
+            channel_ids=channel_ids,
+            file_content=file_content,
+            filename=filename,
+            title=title,
+            message=message,
+            thread_ts=thread_ts,
+        )
 
     async def _async_send_text_only_message(
         self,
-        targets,
-        message,
-        title,
+        targets: list[str],
+        message: str,
+        title: str | None,
+        thread_ts: str | None,
         *,
-        username=None,
-        icon=None,
-        blocks=None,
-    ):
+        username: str | None = None,
+        icon: str | None = None,
+        blocks: Any | None = None,
+    ) -> None:
         """Send a text-only message."""
-        message_dict = {"link_names": True, "text": message}
+        message_dict: MessageT = {"link_names": True, "text": message}
 
         if username:
             message_dict["username"] = username
 
         if icon:
             if icon.lower().startswith(("http://", "https://")):
-                icon_type = "url"
+                message_dict["icon_url"] = icon
             else:
-                icon_type = "emoji"
-
-            message_dict[f"icon_{icon_type}"] = icon
+                message_dict["icon_emoji"] = icon
 
         if blocks:
             message_dict["blocks"] = blocks
+
+        if thread_ts:
+            message_dict["thread_ts"] = thread_ts
 
         tasks = {
             target: self._client.chat_postMessage(**message_dict, channel=target)
@@ -230,20 +263,19 @@ class SlackNotificationService(BaseNotificationService):
         }
 
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        for target, result in zip(tasks, results):
+        for target, result in zip(tasks, results, strict=False):
             if isinstance(result, SlackApiError):
                 _LOGGER.error(
-                    "There was a Slack API error while sending to %s: %s",
+                    "There was a Slack API error while sending to %s: %r",
                     target,
                     result,
                 )
+            elif isinstance(result, ClientError):
+                _LOGGER.error("Error while sending message to %s: %r", target, result)
 
-    async def async_send_message(self, message, **kwargs):
+    async def async_send_message(self, message: str, **kwargs: Any) -> None:
         """Send a message to Slack."""
-        data = kwargs.get(ATTR_DATA)
-
-        if data is None:
-            data = {}
+        data = kwargs.get(ATTR_DATA) or {}
 
         try:
             DATA_SCHEMA(data)
@@ -253,13 +285,14 @@ class SlackNotificationService(BaseNotificationService):
 
         title = kwargs.get(ATTR_TITLE)
         targets = _async_sanitize_channel_names(
-            kwargs.get(ATTR_TARGET, [self._default_channel])
+            kwargs.get(ATTR_TARGET, [self._config[CONF_DEFAULT_CHANNEL]])
         )
 
         # Message Type 1: A text-only message
         if ATTR_FILE not in data:
             if ATTR_BLOCKS_TEMPLATE in data:
-                blocks = _async_templatize_blocks(self.hass, data[ATTR_BLOCKS_TEMPLATE])
+                value = cv.template_complex(data[ATTR_BLOCKS_TEMPLATE])
+                blocks = template.render_complex(value)
             elif ATTR_BLOCKS in data:
                 blocks = data[ATTR_BLOCKS]
             else:
@@ -269,8 +302,9 @@ class SlackNotificationService(BaseNotificationService):
                 targets,
                 message,
                 title,
-                username=data.get(ATTR_USERNAME, self._username),
-                icon=data.get(ATTR_ICON, self._icon),
+                username=data.get(ATTR_USERNAME, self._config.get(ATTR_USERNAME)),
+                icon=data.get(ATTR_ICON, self._config.get(ATTR_ICON)),
+                thread_ts=data.get(ATTR_THREAD_TS),
                 blocks=blocks,
             )
 
@@ -281,11 +315,59 @@ class SlackNotificationService(BaseNotificationService):
                 targets,
                 message,
                 title,
+                thread_ts=data.get(ATTR_THREAD_TS),
                 username=data[ATTR_FILE].get(ATTR_USERNAME),
                 password=data[ATTR_FILE].get(ATTR_PASSWORD),
             )
 
         # Message Type 3: A message that uploads a local file
         return await self._async_send_local_file_message(
-            data[ATTR_FILE][ATTR_PATH], targets, message, title
+            data[ATTR_FILE][ATTR_PATH],
+            targets,
+            message,
+            title,
+            thread_ts=data.get(ATTR_THREAD_TS),
         )
+
+    async def _async_get_channel_id(self, channel_name: str) -> str | None:
+        """Get the Slack channel ID from the channel name.
+
+        This method retrieves the channel ID for a given Slack channel name by
+        querying the Slack API. It handles both public and private channels.
+        Including this so users can  provide channel names instead of IDs.
+
+        Args:
+            channel_name (str): The name of the Slack channel.
+
+        Returns:
+            str | None: The ID of the Slack channel if found, otherwise None.
+
+        Raises:
+            SlackApiError: If there is an error while communicating with the Slack API.
+
+        """
+        try:
+            # Remove # if present
+            channel_name = channel_name.lstrip("#")
+
+            # Get channel list
+            # Multiple types is not working. Tested here: https://api.slack.com/methods/conversations.list/test
+            # response = await self._client.conversations_list(types="public_channel,private_channel")
+            #
+            # Workaround for the types parameter not working
+            channels = []
+            for channel_type in ("public_channel", "private_channel"):
+                response = await self._client.conversations_list(types=channel_type)
+                channels.extend(response["channels"])
+
+            # Find channel ID
+            for channel in channels:
+                if channel["name"] == channel_name:
+                    return cast(str, channel["id"])
+
+            _LOGGER.error("Channel %s not found", channel_name)
+
+        except SlackApiError as err:
+            _LOGGER.error("Error getting channel ID: %r", err)
+
+        return None

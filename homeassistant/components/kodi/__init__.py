@@ -1,9 +1,10 @@
 """The kodi component."""
 
-import asyncio
+from dataclasses import dataclass
 import logging
 
 from pykodi import CannotConnectError, InvalidAuthError, Kodi, get_kodi_connection
+from pykodi.kodi import KodiHTTPConnection, KodiWSConnection
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -13,29 +14,28 @@ from homeassistant.const import (
     CONF_SSL,
     CONF_USERNAME,
     EVENT_HOMEASSISTANT_STOP,
+    Platform,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import (
-    CONF_WS_PORT,
-    DATA_CONNECTION,
-    DATA_KODI,
-    DATA_REMOVE_LISTENER,
-    DOMAIN,
-)
+from .const import CONF_WS_PORT
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS = ["media_player"]
+PLATFORMS = [Platform.MEDIA_PLAYER]
+
+type KodiConfigEntry = ConfigEntry[KodiRuntimeData]
 
 
-async def async_setup(hass, config):
-    """Set up the Kodi integration."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
+@dataclass
+class KodiRuntimeData:
+    """Data class to hold Kodi runtime data."""
+
+    connection: KodiHTTPConnection | KodiWSConnection
+    kodi: Kodi
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: KodiConfigEntry) -> bool:
     """Set up Kodi from a config entry."""
     conn = get_kodi_connection(
         entry.data[CONF_HOST],
@@ -64,35 +64,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def _close(event):
         await conn.close()
 
-    remove_stop_listener = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _close)
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _close))
 
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_CONNECTION: conn,
-        DATA_KODI: kodi,
-        DATA_REMOVE_LISTENER: remove_stop_listener,
-    }
+    entry.runtime_data = KodiRuntimeData(connection=conn, kodi=kodi)
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: KodiConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
-    if unload_ok:
-        data = hass.data[DOMAIN].pop(entry.entry_id)
-        await data[DATA_CONNECTION].close()
-        data[DATA_REMOVE_LISTENER]()
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await entry.runtime_data.connection.close()
 
     return unload_ok

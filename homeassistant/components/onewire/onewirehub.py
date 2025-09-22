@@ -1,96 +1,180 @@
 """Hub for communication with 1-Wire server or mount_dir."""
+
+from __future__ import annotations
+
+import contextlib
+from datetime import datetime, timedelta
+import logging
 import os
 
-from pi1wire import Pi1Wire
 from pyownet import protocol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.const import ATTR_VIA_DEVICE, CONF_HOST, CONF_PORT
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util.signal_type import SignalType
 
-from .const import CONF_MOUNT_DIR, CONF_TYPE_OWSERVER, CONF_TYPE_SYSBUS
+from .const import (
+    DEVICE_SUPPORT,
+    DOMAIN,
+    MANUFACTURER_EDS,
+    MANUFACTURER_HOBBYBOARDS,
+    MANUFACTURER_MAXIM,
+)
+from .model import OWDeviceDescription
 
 DEVICE_COUPLERS = {
     # Family : [branches]
     "1F": ["aux", "main"]
 }
 
+DEVICE_MANUFACTURER = {
+    "7E": MANUFACTURER_EDS,
+    "EF": MANUFACTURER_HOBBYBOARDS,
+}
+
+_DEVICE_SCAN_INTERVAL = timedelta(minutes=5)
+_LOGGER = logging.getLogger(__name__)
+
+type OneWireConfigEntry = ConfigEntry[OneWireHub]
+
+SIGNAL_NEW_DEVICE_CONNECTED = SignalType["OneWireHub", list[OWDeviceDescription]](
+    f"{DOMAIN}_new_device_connected"
+)
+
+
+def _is_known_device(device_family: str, device_type: str | None) -> bool:
+    """Check if device family/type is known to the library."""
+    if device_family in ("7E", "EF"):  # EDS or HobbyBoard
+        return device_type in DEVICE_SUPPORT[device_family]
+    return device_family in DEVICE_SUPPORT
+
 
 class OneWireHub:
-    """Hub to communicate with SysBus or OWServer."""
+    """Hub to communicate with server."""
 
-    def __init__(self, hass: HomeAssistantType):
+    owproxy: protocol._Proxy
+    devices: list[OWDeviceDescription]
+    _version: str | None = None
+
+    def __init__(self, hass: HomeAssistant, config_entry: OneWireConfigEntry) -> None:
         """Initialize."""
-        self.hass = hass
-        self.type: str = None
-        self.pi1proxy: Pi1Wire = None
-        self.owproxy: protocol._Proxy = None
-        self.devices = None
+        self._hass = hass
+        self._config_entry = config_entry
 
-    async def connect(self, host: str, port: int) -> None:
-        """Connect to the owserver host."""
-        try:
-            self.owproxy = await self.hass.async_add_executor_job(
-                protocol.proxy, host, port
-            )
-        except protocol.ConnError as exc:
-            raise CannotConnect from exc
+    def _initialize(self) -> None:
+        """Connect to the server, and discover connected devices.
 
-    async def check_mount_dir(self, mount_dir: str) -> None:
-        """Test that the mount_dir is a valid path."""
-        if not await self.hass.async_add_executor_job(os.path.isdir, mount_dir):
-            raise InvalidPath
-        self.pi1proxy = Pi1Wire(mount_dir)
+        Needs to be run in executor.
+        """
+        host = self._config_entry.data[CONF_HOST]
+        port = self._config_entry.data[CONF_PORT]
+        _LOGGER.debug("Initializing connection to %s:%s", host, port)
+        self.owproxy = protocol.proxy(host, port)
+        with contextlib.suppress(protocol.OwnetError):
+            # Version is not available on all servers
+            self._version = self.owproxy.read(protocol.PTH_VERSION).decode()
+        self.devices = _discover_devices(self.owproxy)
 
-    async def initialize(self, config_entry: ConfigEntry) -> None:
+    async def initialize(self) -> None:
         """Initialize a config entry."""
-        self.type = config_entry.data[CONF_TYPE]
-        if self.type == CONF_TYPE_SYSBUS:
-            await self.check_mount_dir(config_entry.data[CONF_MOUNT_DIR])
-        elif self.type == CONF_TYPE_OWSERVER:
-            host = config_entry.data[CONF_HOST]
-            port = config_entry.data[CONF_PORT]
-            await self.connect(host, port)
-        await self.discover_devices()
+        await self._hass.async_add_executor_job(self._initialize)
+        self._populate_device_registry(self.devices)
 
-    async def discover_devices(self):
-        """Discover all devices."""
-        if self.devices is None:
-            if self.type == CONF_TYPE_SYSBUS:
-                self.devices = await self.hass.async_add_executor_job(
-                    self.pi1proxy.find_all_sensors
+    @callback
+    def _populate_device_registry(self, devices: list[OWDeviceDescription]) -> None:
+        """Populate the device registry."""
+        device_registry = dr.async_get(self._hass)
+        for device in devices:
+            device.device_info["sw_version"] = self._version
+            device_registry.async_get_or_create(
+                config_entry_id=self._config_entry.entry_id,
+                **device.device_info,
+            )
+
+    def schedule_scan_for_new_devices(self) -> None:
+        """Schedule a regular scan of the bus for new devices."""
+        self._config_entry.async_on_unload(
+            async_track_time_interval(
+                self._hass, self._scan_for_new_devices, _DEVICE_SCAN_INTERVAL
+            )
+        )
+
+    async def _scan_for_new_devices(self, _: datetime) -> None:
+        """Scan the bus for new devices."""
+        devices = await self._hass.async_add_executor_job(
+            _discover_devices, self.owproxy
+        )
+        existing_device_ids = [device.id for device in self.devices]
+        new_devices = [
+            device for device in devices if device.id not in existing_device_ids
+        ]
+        if new_devices:
+            self.devices.extend(new_devices)
+            self._populate_device_registry(new_devices)
+            async_dispatcher_send(
+                self._hass, SIGNAL_NEW_DEVICE_CONNECTED, self, new_devices
+            )
+
+
+def _discover_devices(
+    owproxy: protocol._Proxy, path: str = "/", parent_id: str | None = None
+) -> list[OWDeviceDescription]:
+    """Discover all server devices."""
+    devices: list[OWDeviceDescription] = []
+    for device_path in owproxy.dir(path):
+        device_id = os.path.split(os.path.split(device_path)[0])[1]
+        device_family = owproxy.read(f"{device_path}family").decode()
+        _LOGGER.debug("read `%sfamily`: %s", device_path, device_family)
+        device_type = _get_device_type(owproxy, device_path)
+        if not _is_known_device(device_family, device_type):
+            _LOGGER.warning(
+                "Ignoring unknown device family/type (%s/%s) found for device %s",
+                device_family,
+                device_type,
+                device_id,
+            )
+            continue
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_id)},
+            manufacturer=DEVICE_MANUFACTURER.get(device_family, MANUFACTURER_MAXIM),
+            model=device_type,
+            model_id=device_type,
+            name=device_id,
+            serial_number=device_id[3:],
+        )
+        if parent_id:
+            device_info[ATTR_VIA_DEVICE] = (DOMAIN, parent_id)
+        device = OWDeviceDescription(
+            device_info=device_info,
+            id=device_id,
+            family=device_family,
+            path=device_path,
+            type=device_type,
+        )
+        devices.append(device)
+        if device_branches := DEVICE_COUPLERS.get(device_family):
+            for branch in device_branches:
+                devices += _discover_devices(
+                    owproxy, f"{device_path}{branch}", device_id
                 )
-            if self.type == CONF_TYPE_OWSERVER:
-                self.devices = await self.hass.async_add_executor_job(
-                    self._discover_devices_owserver
-                )
-        return self.devices
 
-    def _discover_devices_owserver(self, path="/"):
-        """Discover all owserver devices."""
-        devices = []
-        for device_path in self.owproxy.dir(path):
-            device_family = self.owproxy.read(f"{device_path}family").decode()
-            device_type = self.owproxy.read(f"{device_path}type").decode()
-            device_branches = DEVICE_COUPLERS.get(device_family)
-            if device_branches:
-                for branch in device_branches:
-                    devices += self._discover_devices_owserver(f"{device_path}{branch}")
-            else:
-                devices.append(
-                    {
-                        "path": device_path,
-                        "family": device_family,
-                        "type": device_type,
-                    }
-                )
-        return devices
+    return devices
 
 
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-class InvalidPath(HomeAssistantError):
-    """Error to indicate the path is invalid."""
+def _get_device_type(owproxy: protocol._Proxy, device_path: str) -> str | None:
+    """Get device model."""
+    try:
+        device_type: str = owproxy.read(f"{device_path}type").decode()
+    except protocol.ProtocolError as exc:
+        _LOGGER.debug("Unable to read `%stype`: %s", device_path, exc)
+        return None
+    _LOGGER.debug("read `%stype`: %s", device_path, device_type)
+    if device_type == "EDS":
+        device_type = owproxy.read(f"{device_path}device_type").decode()
+        _LOGGER.debug("read `%sdevice_type`: %s", device_path, device_type)
+    return device_type

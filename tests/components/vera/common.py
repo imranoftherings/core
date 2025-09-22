@@ -1,6 +1,10 @@
 """Common code for tests."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
 from enum import Enum
-from typing import Callable, Dict, NamedTuple, Tuple
+from typing import NamedTuple
 from unittest.mock import MagicMock
 
 import pyvera as pv
@@ -16,7 +20,7 @@ from homeassistant.setup import async_setup_component
 
 from tests.common import MockConfigEntry
 
-SetupCallback = Callable[[pv.VeraController, dict], None]
+type SetupCallback = Callable[[pv.VeraController, dict], None]
 
 
 class ControllerData(NamedTuple):
@@ -29,7 +33,7 @@ class ControllerData(NamedTuple):
 class ComponentData(NamedTuple):
     """Test data about the vera component."""
 
-    controller_data: Tuple[ControllerData]
+    controller_data: tuple[ControllerData]
 
 
 class ConfigSource(Enum):
@@ -43,27 +47,27 @@ class ConfigSource(Enum):
 class ControllerConfig(NamedTuple):
     """Test config for mocking a vera controller."""
 
-    config: Dict
-    options: Dict
+    config: dict
+    options: dict
     config_source: ConfigSource
     serial_number: str
-    devices: Tuple[pv.VeraDevice, ...]
-    scenes: Tuple[pv.VeraScene, ...]
+    devices: tuple[pv.VeraDevice, ...]
+    scenes: tuple[pv.VeraScene, ...]
     setup_callback: SetupCallback
     legacy_entity_unique_id: bool
 
 
 def new_simple_controller_config(
-    config: dict = None,
-    options: dict = None,
+    config: dict | None = None,
+    options: dict | None = None,
     config_source=ConfigSource.CONFIG_FLOW,
     serial_number="1111",
-    devices: Tuple[pv.VeraDevice, ...] = (),
-    scenes: Tuple[pv.VeraScene, ...] = (),
+    devices: tuple[pv.VeraDevice, ...] = (),
+    scenes: tuple[pv.VeraScene, ...] = (),
     setup_callback: SetupCallback = None,
     legacy_entity_unique_id=False,
 ) -> ControllerConfig:
-    """Create simple contorller config."""
+    """Create simple controller config."""
     return ControllerConfig(
         config=config or {CONF_CONTROLLER: "http://127.0.0.1:123"},
         options=options,
@@ -79,7 +83,7 @@ def new_simple_controller_config(
 class ComponentFactory:
     """Factory class."""
 
-    def __init__(self, vera_controller_class_mock):
+    def __init__(self, vera_controller_class_mock) -> None:
         """Initialize the factory."""
         self.vera_controller_class_mock = vera_controller_class_mock
 
@@ -87,7 +91,7 @@ class ComponentFactory:
         self,
         hass: HomeAssistant,
         controller_config: ControllerConfig = None,
-        controller_configs: Tuple[ControllerConfig] = (),
+        controller_configs: tuple[ControllerConfig] = (),
     ) -> ComponentData:
         """Configure the component with multiple specific mock data."""
         configs = list(controller_configs)
@@ -116,7 +120,7 @@ class ComponentFactory:
         if controller_config.legacy_entity_unique_id:
             component_config[CONF_LEGACY_UNIQUE_ID] = True
 
-        controller = MagicMock(spec=pv.VeraController)  # type: pv.VeraController
+        controller: pv.VeraController = MagicMock()
         controller.base_url = component_config.get(CONF_CONTROLLER)
         controller.register = MagicMock()
         controller.start = MagicMock()

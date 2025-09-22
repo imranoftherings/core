@@ -1,59 +1,54 @@
 """Support for Aqualink temperature sensors."""
-from typing import Optional
 
-from homeassistant.components.sensor import DOMAIN
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import DEVICE_CLASS_TEMPERATURE, TEMP_CELSIUS, TEMP_FAHRENHEIT
-from homeassistant.helpers.typing import HomeAssistantType
+from __future__ import annotations
 
-from . import AqualinkEntity
-from .const import DOMAIN as AQUALINK_DOMAIN
+from iaqualink.device import AqualinkSensor
+
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.const import UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import AqualinkConfigEntry
+from .entity import AqualinkEntity
 
 PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
-    hass: HomeAssistantType, config_entry: ConfigEntry, async_add_entities
+    hass: HomeAssistant,
+    config_entry: AqualinkConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up discovered sensors."""
-    devs = []
-    for dev in hass.data[AQUALINK_DOMAIN][DOMAIN]:
-        devs.append(HassAqualinkSensor(dev))
-    async_add_entities(devs, True)
+    async_add_entities(
+        (HassAqualinkSensor(dev) for dev in config_entry.runtime_data.sensors),
+        True,
+    )
 
 
-class HassAqualinkSensor(AqualinkEntity):
+class HassAqualinkSensor(AqualinkEntity[AqualinkSensor], SensorEntity):
     """Representation of a sensor."""
 
-    @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        return self.dev.label
+    def __init__(self, dev: AqualinkSensor) -> None:
+        """Initialize AquaLink sensor."""
+        super().__init__(dev)
+        self._attr_name = dev.label
+        if not dev.name.endswith("_temp"):
+            return
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        if dev.system.temp_unit == "F":
+            self._attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+            return
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
 
     @property
-    def unit_of_measurement(self) -> Optional[str]:
-        """Return the measurement unit for the sensor."""
-        if self.dev.name.endswith("_temp"):
-            if self.dev.system.temp_unit == "F":
-                return TEMP_FAHRENHEIT
-            return TEMP_CELSIUS
-        return None
-
-    @property
-    def state(self) -> Optional[str]:
+    def native_value(self) -> int | float | None:
         """Return the state of the sensor."""
         if self.dev.state == "":
             return None
 
         try:
-            state = int(self.dev.state)
+            return int(self.dev.state)
         except ValueError:
-            state = float(self.dev.state)
-        return state
-
-    @property
-    def device_class(self) -> Optional[str]:
-        """Return the class of the sensor."""
-        if self.dev.name.endswith("_temp"):
-            return DEVICE_CLASS_TEMPERATURE
-        return None
+            return float(self.dev.state)

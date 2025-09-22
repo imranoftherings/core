@@ -1,21 +1,23 @@
 """YAML utility functions."""
-from .const import _SECRET_NAMESPACE, SECRET_YAML
+
+from annotatedyaml import SECRET_YAML, Input, YamlTypeError
+from annotatedyaml.input import UndefinedSubstitution, extract_inputs, substitute
+
 from .dumper import dump, save_yaml
-from .input import UndefinedSubstitution, extract_inputs, substitute
-from .loader import clear_secret_cache, load_yaml, parse_yaml, secret_yaml
-from .objects import Input
+from .loader import Secrets, load_yaml, load_yaml_dict, parse_yaml, secret_yaml
 
 __all__ = [
     "SECRET_YAML",
-    "_SECRET_NAMESPACE",
     "Input",
-    "dump",
-    "save_yaml",
-    "clear_secret_cache",
-    "load_yaml",
-    "secret_yaml",
-    "parse_yaml",
+    "Secrets",
     "UndefinedSubstitution",
+    "YamlTypeError",
+    "dump",
     "extract_inputs",
+    "load_yaml",
+    "load_yaml_dict",
+    "parse_yaml",
+    "save_yaml",
+    "secret_yaml",
     "substitute",
 ]

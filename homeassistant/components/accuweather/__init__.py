@@ -1,132 +1,86 @@
 """The AccuWeather component."""
+
+from __future__ import annotations
+
 import asyncio
-from datetime import timedelta
 import logging
 
-from accuweather import AccuWeather, ApiError, InvalidApiKeyError, RequestsExceededError
-from aiohttp.client_exceptions import ClientConnectorError
-from async_timeout import timeout
+from accuweather import AccuWeather
 
-from homeassistant.const import CONF_API_KEY
-from homeassistant.core import Config, HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.components.sensor import DOMAIN as SENSOR_PLATFORM
+from homeassistant.const import CONF_API_KEY, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import (
-    ATTR_FORECAST,
-    CONF_FORECAST,
-    COORDINATOR,
-    DOMAIN,
-    UNDO_UPDATE_LISTENER,
+from .const import DOMAIN
+from .coordinator import (
+    AccuWeatherConfigEntry,
+    AccuWeatherDailyForecastDataUpdateCoordinator,
+    AccuWeatherData,
+    AccuWeatherHourlyForecastDataUpdateCoordinator,
+    AccuWeatherObservationDataUpdateCoordinator,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["sensor", "weather"]
+PLATFORMS = [Platform.SENSOR, Platform.WEATHER]
 
 
-async def async_setup(hass: HomeAssistant, config: Config) -> bool:
-    """Set up configured AccuWeather."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
-
-
-async def async_setup_entry(hass, config_entry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: AccuWeatherConfigEntry) -> bool:
     """Set up AccuWeather as config entry."""
-    api_key = config_entry.data[CONF_API_KEY]
-    location_key = config_entry.unique_id
-    forecast = config_entry.options.get(CONF_FORECAST, False)
+    api_key: str = entry.data[CONF_API_KEY]
 
-    _LOGGER.debug("Using location_key: %s, get forecast: %s", location_key, forecast)
+    location_key = entry.unique_id
+
+    _LOGGER.debug("Using location_key: %s", location_key)
 
     websession = async_get_clientsession(hass)
+    accuweather = AccuWeather(api_key, websession, location_key=location_key)
 
-    coordinator = AccuWeatherDataUpdateCoordinator(
-        hass, websession, api_key, location_key, forecast
+    coordinator_observation = AccuWeatherObservationDataUpdateCoordinator(
+        hass,
+        entry,
+        accuweather,
     )
-    await coordinator.async_refresh()
+    coordinator_daily_forecast = AccuWeatherDailyForecastDataUpdateCoordinator(
+        hass,
+        entry,
+        accuweather,
+    )
+    coordinator_hourly_forecast = AccuWeatherHourlyForecastDataUpdateCoordinator(
+        hass,
+        entry,
+        accuweather,
+    )
 
-    if not coordinator.last_update_success:
-        raise ConfigEntryNotReady
+    await asyncio.gather(
+        coordinator_observation.async_config_entry_first_refresh(),
+        coordinator_daily_forecast.async_config_entry_first_refresh(),
+        coordinator_hourly_forecast.async_config_entry_first_refresh(),
+    )
 
-    undo_listener = config_entry.add_update_listener(update_listener)
+    entry.runtime_data = AccuWeatherData(
+        coordinator_observation=coordinator_observation,
+        coordinator_daily_forecast=coordinator_daily_forecast,
+        coordinator_hourly_forecast=coordinator_hourly_forecast,
+    )
 
-    hass.data[DOMAIN][config_entry.entry_id] = {
-        COORDINATOR: coordinator,
-        UNDO_UPDATE_LISTENER: undo_listener,
-    }
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(config_entry, component)
-        )
+    # Remove ozone sensors from registry if they exist
+    ent_reg = er.async_get(hass)
+    for day in range(5):
+        unique_id = f"{location_key}-ozone-{day}"
+        if entity_id := ent_reg.async_get_entity_id(SENSOR_PLATFORM, DOMAIN, unique_id):
+            _LOGGER.debug("Removing ozone sensor entity %s", entity_id)
+            ent_reg.async_remove(entity_id)
 
     return True
 
 
-async def async_unload_entry(hass, config_entry):
+async def async_unload_entry(
+    hass: HomeAssistant, entry: AccuWeatherConfigEntry
+) -> bool:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(config_entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
-
-    hass.data[DOMAIN][config_entry.entry_id][UNDO_UPDATE_LISTENER]()
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(config_entry.entry_id)
-
-    return unload_ok
-
-
-async def update_listener(hass, config_entry):
-    """Update listener."""
-    await hass.config_entries.async_reload(config_entry.entry_id)
-
-
-class AccuWeatherDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching AccuWeather data API."""
-
-    def __init__(self, hass, session, api_key, location_key, forecast: bool):
-        """Initialize."""
-        self.location_key = location_key
-        self.forecast = forecast
-        self.is_metric = hass.config.units.is_metric
-        self.accuweather = AccuWeather(api_key, session, location_key=self.location_key)
-
-        # Enabling the forecast download increases the number of requests per data
-        # update, we use 32 minutes for current condition only and 64 minutes for
-        # current condition and forecast as update interval to not exceed allowed number
-        # of requests. We have 50 requests allowed per day, so we use 45 and leave 5 as
-        # a reserve for restarting HA.
-        update_interval = (
-            timedelta(minutes=64) if self.forecast else timedelta(minutes=32)
-        )
-        _LOGGER.debug("Data will be update every %s", update_interval)
-
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=update_interval)
-
-    async def _async_update_data(self):
-        """Update data via library."""
-        try:
-            async with timeout(10):
-                current = await self.accuweather.async_get_current_conditions()
-                forecast = (
-                    await self.accuweather.async_get_forecast(metric=self.is_metric)
-                    if self.forecast
-                    else {}
-                )
-        except (
-            ApiError,
-            ClientConnectorError,
-            InvalidApiKeyError,
-            RequestsExceededError,
-        ) as error:
-            raise UpdateFailed(error) from error
-        _LOGGER.debug("Requests remaining: %s", self.accuweather.requests_remaining)
-        return {**current, **{ATTR_FORECAST: forecast}}
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

@@ -1,58 +1,74 @@
 """Define tests for device-related endpoints."""
+
 from datetime import timedelta
+from unittest.mock import patch
 
-from homeassistant.components.flo.const import DOMAIN as FLO_DOMAIN
-from homeassistant.components.flo.device import FloDeviceDataUpdateCoordinator
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.setup import async_setup_component
-from homeassistant.util import dt
+from aioflo.errors import RequestError
+from freezegun.api import FrozenDateTimeFactory
+import pytest
 
-from .common import TEST_PASSWORD, TEST_USER_ID
+from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant
 
-from tests.common import async_fire_time_changed
+from tests.common import MockConfigEntry, async_fire_time_changed
+from tests.test_util.aiohttp import AiohttpClientMocker
 
 
-async def test_device(hass, config_entry, aioclient_mock_fixture, aioclient_mock):
-    """Test Flo by Moen device."""
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_device(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test Flo by Moen devices."""
     config_entry.add_to_hass(hass)
-    assert await async_setup_component(
-        hass, FLO_DOMAIN, {CONF_USERNAME: TEST_USER_ID, CONF_PASSWORD: TEST_PASSWORD}
-    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
     await hass.async_block_till_done()
-    assert len(hass.data[FLO_DOMAIN][config_entry.entry_id]["devices"]) == 1
-
-    device: FloDeviceDataUpdateCoordinator = hass.data[FLO_DOMAIN][
-        config_entry.entry_id
-    ]["devices"][0]
-    assert device.api_client is not None
-    assert device.available
-    assert device.consumption_today == 3.674
-    assert device.current_flow_rate == 0
-    assert device.current_psi == 54.20000076293945
-    assert device.current_system_mode == "home"
-    assert device.target_system_mode == "home"
-    assert device.firmware_version == "6.1.1"
-    assert device.device_type == "flo_device_v2"
-    assert device.id == "98765"
-    assert device.last_heard_from_time == "2020-07-24T12:45:00Z"
-    assert device.location_id == "mmnnoopp"
-    assert device.hass is not None
-    assert device.temperature == 70
-    assert device.mac_address == "111111111111"
-    assert device.model == "flo_device_075_v2"
-    assert device.manufacturer == "Flo by Moen"
-    assert device.device_name == "Flo by Moen flo_device_075_v2"
-    assert device.rssi == -47
-    assert device.pending_info_alerts_count == 0
-    assert device.pending_critical_alerts_count == 0
-    assert device.pending_warning_alerts_count == 2
-    assert device.has_alerts is True
-    assert device.last_known_valve_state == "open"
-    assert device.target_valve_state == "open"
 
     call_count = aioclient_mock.call_count
 
-    async_fire_time_changed(hass, dt.utcnow() + timedelta(seconds=90))
+    freezer.tick(timedelta(seconds=90))
+    async_fire_time_changed(hass)
     await hass.async_block_till_done()
 
-    assert aioclient_mock.call_count == call_count + 2
+    assert aioclient_mock.call_count == call_count + 6
+
+
+@pytest.mark.usefixtures("aioclient_mock_fixture")
+async def test_device_failures(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test Flo by Moen devices buffer API failures."""
+    config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    def assert_state(state: str) -> None:
+        assert (
+            hass.states.get("sensor.smart_water_shutoff_current_system_mode").state
+            == state
+        )
+
+    assert_state("home")
+
+    async def move_time_and_assert_state(state: str) -> None:
+        freezer.tick(timedelta(seconds=65))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+        assert_state(state)
+
+    aioclient_mock.clear_requests()
+    with patch(
+        "aioflo.presence.Presence.ping",
+        side_effect=RequestError,
+    ):
+        # simulate 4 updates failing. The failures should be buffered so that it takes 4
+        # consecutive failures to mark the device and entities as unavailable.
+        await move_time_and_assert_state("home")
+        await move_time_and_assert_state("home")
+        await move_time_and_assert_state("home")
+        await move_time_and_assert_state(STATE_UNAVAILABLE)

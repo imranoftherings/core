@@ -1,113 +1,247 @@
 """Support for VeSync fans."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
-from homeassistant.components.fan import (
-    SPEED_HIGH,
-    SPEED_LOW,
-    SPEED_MEDIUM,
-    SPEED_OFF,
-    SUPPORT_SET_SPEED,
-    FanEntity,
-)
-from homeassistant.core import callback
+from pyvesync.base_devices.vesyncbasedevice import VeSyncBaseDevice
+
+from homeassistant.components.fan import FanEntity, FanEntityFeature
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util.percentage import (
+    ordered_list_item_to_percentage,
+    percentage_to_ordered_list_item,
+)
 
-from .common import VeSyncDevice
-from .const import DOMAIN, VS_DISCOVERY, VS_DISPATCHERS, VS_FANS
+from .common import is_fan, is_purifier
+from .const import (
+    DOMAIN,
+    VS_COORDINATOR,
+    VS_DEVICES,
+    VS_DISCOVERY,
+    VS_FAN_MODE_ADVANCED_SLEEP,
+    VS_FAN_MODE_AUTO,
+    VS_FAN_MODE_MANUAL,
+    VS_FAN_MODE_NORMAL,
+    VS_FAN_MODE_PET,
+    VS_FAN_MODE_PRESET_LIST_HA,
+    VS_FAN_MODE_SLEEP,
+    VS_FAN_MODE_TURBO,
+    VS_MANAGER,
+)
+from .coordinator import VeSyncDataCoordinator
+from .entity import VeSyncBaseEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-DEV_TYPE_TO_HA = {
-    "LV-PUR131S": "fan",
-}
 
-FAN_SPEEDS = [SPEED_OFF, SPEED_LOW, SPEED_MEDIUM, SPEED_HIGH]
-FAN_MODE_AUTO = "auto"
-
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the VeSync fan platform."""
 
-    async def async_discover(devices):
+    coordinator = hass.data[DOMAIN][VS_COORDINATOR]
+
+    @callback
+    def discover(devices):
         """Add new devices to platform."""
-        _async_setup_entities(devices, async_add_entities)
+        _setup_entities(devices, async_add_entities, coordinator)
 
-    disp = async_dispatcher_connect(hass, VS_DISCOVERY.format(VS_FANS), async_discover)
-    hass.data[DOMAIN][VS_DISPATCHERS].append(disp)
+    config_entry.async_on_unload(
+        async_dispatcher_connect(hass, VS_DISCOVERY.format(VS_DEVICES), discover)
+    )
 
-    _async_setup_entities(hass.data[DOMAIN][VS_FANS], async_add_entities)
+    _setup_entities(
+        hass.data[DOMAIN][VS_MANAGER].devices, async_add_entities, coordinator
+    )
 
 
 @callback
-def _async_setup_entities(devices, async_add_entities):
-    """Check if device is online and add entity."""
-    dev_list = []
-    for dev in devices:
-        if DEV_TYPE_TO_HA.get(dev.device_type) == "fan":
-            dev_list.append(VeSyncFanHA(dev))
-        else:
-            _LOGGER.warning(
-                "%s - Unknown device type - %s", dev.device_name, dev.device_type
-            )
-            continue
+def _setup_entities(
+    devices: list[VeSyncBaseDevice],
+    async_add_entities,
+    coordinator: VeSyncDataCoordinator,
+):
+    """Check if device is fan and add entity."""
 
-    async_add_entities(dev_list, update_before_add=True)
+    async_add_entities(
+        VeSyncFanHA(dev, coordinator)
+        for dev in devices
+        if is_fan(dev) or is_purifier(dev)
+    )
 
 
-class VeSyncFanHA(VeSyncDevice, FanEntity):
+class VeSyncFanHA(VeSyncBaseEntity, FanEntity):
     """Representation of a VeSync fan."""
 
-    def __init__(self, fan):
-        """Initialize the VeSync fan device."""
-        super().__init__(fan)
-        self.smartfan = fan
+    _attr_supported_features = (
+        FanEntityFeature.SET_SPEED
+        | FanEntityFeature.PRESET_MODE
+        | FanEntityFeature.TURN_OFF
+        | FanEntityFeature.TURN_ON
+    )
+    _attr_name = None
+    _attr_translation_key = "vesync"
 
     @property
-    def supported_features(self):
-        """Flag supported features."""
-        return SUPPORT_SET_SPEED
+    def is_on(self) -> bool:
+        """Return True if device is on."""
+        return self.device.state.device_status == "on"
 
     @property
-    def speed(self):
-        """Return the current speed."""
-        if self.smartfan.mode == FAN_MODE_AUTO:
-            return None
-        if self.smartfan.mode == "manual":
-            current_level = self.smartfan.fan_level
-            if current_level is not None:
-                return FAN_SPEEDS[current_level]
+    def percentage(self) -> int | None:
+        """Return the currently set speed."""
+
+        current_level = self.device.state.fan_level
+
+        if self.device.state.mode == VS_FAN_MODE_MANUAL and current_level is not None:
+            return ordered_list_item_to_percentage(
+                self.device.fan_levels, current_level
+            )
         return None
 
     @property
-    def speed_list(self):
-        """Get the list of available speeds."""
-        return FAN_SPEEDS
+    def speed_count(self) -> int:
+        """Return the number of speeds the fan supports."""
+        return len(self.device.fan_levels)
 
     @property
-    def unique_info(self):
-        """Return the ID of this fan."""
-        return self.smartfan.uuid
+    def preset_modes(self) -> list[str]:
+        """Get the list of available preset modes."""
+        if hasattr(self.device, "modes"):
+            return sorted(
+                [
+                    mode
+                    for mode in self.device.modes
+                    if mode in VS_FAN_MODE_PRESET_LIST_HA
+                ]
+            )
+        return []
 
     @property
-    def device_state_attributes(self):
+    def preset_mode(self) -> str | None:
+        """Get the current preset mode."""
+        if self.device.state.mode in VS_FAN_MODE_PRESET_LIST_HA:
+            return self.device.state.mode
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the fan."""
-        return {
-            "mode": self.smartfan.mode,
-            "active_time": self.smartfan.active_time,
-            "filter_life": self.smartfan.filter_life,
-            "air_quality": self.smartfan.air_quality,
-            "screen_status": self.smartfan.screen_status,
-        }
+        attr = {}
 
-    def set_speed(self, speed):
-        """Set the speed of the device."""
-        if not self.smartfan.is_on:
-            self.smartfan.turn_on()
+        if hasattr(self.device.state, "active_time"):
+            attr["active_time"] = self.device.state.active_time
 
-        self.smartfan.manual_mode()
-        self.smartfan.change_fan_speed(FAN_SPEEDS.index(speed))
+        if hasattr(self.device.state, "display_status"):
+            attr["display_status"] = self.device.state.display_status
 
-    def turn_on(self, speed: str = None, **kwargs) -> None:
+        if hasattr(self.device.state, "child_lock"):
+            attr["child_lock"] = self.device.state.child_lock
+
+        if hasattr(self.device.state, "nightlight_status"):
+            attr["night_light"] = self.device.state.nightlight_status
+
+        if hasattr(self.device.state, "mode"):
+            attr["mode"] = self.device.state.mode
+
+        return attr
+
+    async def async_set_percentage(self, percentage: int) -> None:
+        """Set the speed of the device.
+
+        If percentage is 0, turn off the fan. Otherwise, ensure the fan is on,
+        set manual mode if needed, and set the speed.
+        """
+        if percentage == 0:
+            # Turning off is a special case: do not set speed or mode
+            if not await self.device.turn_off():
+                raise HomeAssistantError(
+                    "An error occurred while turning off: "
+                    + self.device.last_response.message
+                )
+            self.schedule_update_ha_state()
+            return
+
+        # If the fan is off, turn it on first
+        if not self.device.is_on:
+            if not await self.device.turn_on():
+                raise HomeAssistantError(
+                    "An error occurred while turning on: "
+                    + self.device.last_response.message
+                )
+
+        # Switch to manual mode if not already set
+        if self.device.state.mode != VS_FAN_MODE_MANUAL:
+            if not await self.device.set_manual_mode():
+                raise HomeAssistantError(
+                    "An error occurred while setting manual mode."
+                    + self.device.last_response.message
+                )
+
+        # Calculate the speed level and set it
+        if not await self.device.set_fan_speed(
+            percentage_to_ordered_list_item(self.device.fan_levels, percentage)
+        ):
+            raise HomeAssistantError(
+                "An error occurred while changing fan speed: "
+                + self.device.last_response.message
+            )
+
+        self.schedule_update_ha_state()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set the preset mode of device."""
+        if preset_mode not in VS_FAN_MODE_PRESET_LIST_HA:
+            raise ValueError(
+                f"{preset_mode} is not one of the valid preset modes: "
+                f"{VS_FAN_MODE_PRESET_LIST_HA}"
+            )
+
+        if not self.device.is_on:
+            await self.device.turn_on()
+
+        if preset_mode == VS_FAN_MODE_AUTO:
+            success = await self.device.auto_mode()
+        elif preset_mode == VS_FAN_MODE_SLEEP:
+            success = await self.device.sleep_mode()
+        elif preset_mode == VS_FAN_MODE_ADVANCED_SLEEP:
+            success = await self.device.advanced_sleep_mode()
+        elif preset_mode == VS_FAN_MODE_PET:
+            success = await self.device.pet_mode()
+        elif preset_mode == VS_FAN_MODE_TURBO:
+            success = await self.device.turbo_mode()
+        elif preset_mode == VS_FAN_MODE_NORMAL:
+            success = await self.device.normal_mode()
+        if not success:
+            raise HomeAssistantError(self.device.last_response.message)
+
+        self.schedule_update_ha_state()
+
+    async def async_turn_on(
+        self,
+        percentage: int | None = None,
+        preset_mode: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Turn the device on."""
-        self.smartfan.turn_on()
-        self.set_speed(speed)
+        if preset_mode:
+            await self.async_set_preset_mode(preset_mode)
+            return
+        if percentage is None:
+            percentage = 50
+        await self.async_set_percentage(percentage)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the device off."""
+        success = await self.device.turn_off()
+        if not success:
+            raise HomeAssistantError(self.device.last_response.message)
+        self.schedule_update_ha_state()

@@ -1,28 +1,80 @@
 """The ping component."""
 
-from homeassistant.core import callback
+from __future__ import annotations
 
-DOMAIN = "ping"
-PLATFORMS = ["binary_sensor"]
+import logging
 
-PING_ID = "ping_id"
-DEFAULT_START_ID = 129
-MAX_PING_ID = 65534
+from icmplib import SocketPermissionError, async_ping
+
+from homeassistant.const import CONF_HOST, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.hass_dict import HassKey
+
+from .const import CONF_PING_COUNT, DOMAIN
+from .coordinator import PingConfigEntry, PingUpdateCoordinator
+from .helpers import PingDataICMPLib, PingDataSubProcess
+
+_LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.DEVICE_TRACKER, Platform.SENSOR]
+DATA_PRIVILEGED_KEY: HassKey[bool | None] = HassKey(DOMAIN)
 
 
-@callback
-def async_get_next_ping_id(hass):
-    """Find the next id to use in the outbound ping.
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the ping integration."""
+    hass.data[DATA_PRIVILEGED_KEY] = await _can_use_icmp_lib_with_privilege()
 
-    Must be called in async
-    """
-    current_id = hass.data.setdefault(DOMAIN, {}).get(PING_ID, DEFAULT_START_ID)
+    return True
 
-    if current_id == MAX_PING_ID:
-        next_id = DEFAULT_START_ID
+
+async def async_setup_entry(hass: HomeAssistant, entry: PingConfigEntry) -> bool:
+    """Set up Ping (ICMP) from a config entry."""
+    privileged = hass.data[DATA_PRIVILEGED_KEY]
+
+    host: str = entry.options[CONF_HOST]
+    count: int = int(entry.options[CONF_PING_COUNT])
+    ping_cls: type[PingDataICMPLib | PingDataSubProcess]
+    if privileged is None:
+        ping_cls = PingDataSubProcess
     else:
-        next_id = current_id + 1
+        ping_cls = PingDataICMPLib
 
-    hass.data[DOMAIN][PING_ID] = next_id
+    coordinator = PingUpdateCoordinator(
+        hass=hass, config_entry=entry, ping=ping_cls(hass, host, count, privileged)
+    )
+    await coordinator.async_config_entry_first_refresh()
 
-    return next_id
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: PingConfigEntry) -> bool:
+    """Unload a config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def _can_use_icmp_lib_with_privilege() -> bool | None:
+    """Verify we can create a raw socket."""
+    try:
+        await async_ping("127.0.0.1", count=0, timeout=0, privileged=True)
+    except SocketPermissionError:
+        try:
+            await async_ping("127.0.0.1", count=0, timeout=0, privileged=False)
+        except SocketPermissionError:
+            _LOGGER.debug(
+                "Cannot use icmplib because privileges are insufficient to create the"
+                " socket"
+            )
+            return None
+
+        _LOGGER.debug("Using icmplib in privileged=False mode")
+        return False
+
+    _LOGGER.debug("Using icmplib in privileged=True mode")
+    return True

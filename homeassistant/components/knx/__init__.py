@@ -1,463 +1,210 @@
-"""Support KNX devices."""
-import asyncio
-import logging
+"""The KNX integration."""
+
+from __future__ import annotations
+
+import contextlib
+from pathlib import Path
+from typing import Final
 
 import voluptuous as vol
-from xknx import XKNX
-from xknx.devices import DateTime, ExposeSensor
-from xknx.dpt import DPTArray, DPTBase, DPTBinary
 from xknx.exceptions import XKNXException
-from xknx.io import (
-    DEFAULT_MCAST_GRP,
-    DEFAULT_MCAST_PORT,
-    ConnectionConfig,
-    ConnectionType,
-)
-from xknx.telegram import AddressFilter, GroupAddress, Telegram
-from xknx.telegram.apci import GroupValueResponse, GroupValueWrite
 
-from homeassistant.const import (
-    CONF_ENTITY_ID,
-    CONF_HOST,
-    CONF_PORT,
-    EVENT_HOMEASSISTANT_STOP,
-    SERVICE_RELOAD,
-    STATE_OFF,
-    STATE_ON,
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-)
-from homeassistant.core import callback
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity_platform import async_get_platforms
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.reload import async_integration_yaml_config
-from homeassistant.helpers.service import async_register_admin_service
-from homeassistant.helpers.typing import ServiceCallType
+from homeassistant.helpers.storage import STORAGE_DIR
+from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN, SupportedPlatforms
-from .factory import create_knx_device
+from .const import (
+    CONF_KNX_EXPOSE,
+    CONF_KNX_KNXKEY_FILENAME,
+    DATA_HASS_CONFIG,
+    DOMAIN,
+    KNX_MODULE_KEY,
+    SUPPORTED_PLATFORMS_UI,
+    SUPPORTED_PLATFORMS_YAML,
+)
+from .expose import create_knx_exposure
+from .knx_module import KNXModule
+from .project import STORAGE_KEY as PROJECT_STORAGE_KEY
 from .schema import (
     BinarySensorSchema,
+    ButtonSchema,
     ClimateSchema,
-    ConnectionSchema,
     CoverSchema,
+    DateSchema,
+    DateTimeSchema,
+    EventSchema,
     ExposeSchema,
+    FanSchema,
     LightSchema,
     NotifySchema,
+    NumberSchema,
     SceneSchema,
+    SelectSchema,
     SensorSchema,
     SwitchSchema,
+    TextSchema,
+    TimeSchema,
     WeatherSchema,
 )
+from .services import async_setup_services
+from .storage.config_store import STORAGE_KEY as CONFIG_STORAGE_KEY
+from .telegrams import STORAGE_KEY as TELEGRAMS_STORAGE_KEY
+from .websocket import register_panel
 
-_LOGGER = logging.getLogger(__name__)
-
-CONF_KNX_CONFIG = "config_file"
-
-CONF_KNX_ROUTING = "routing"
-CONF_KNX_TUNNELING = "tunneling"
-CONF_KNX_FIRE_EVENT = "fire_event"
-CONF_KNX_FIRE_EVENT_FILTER = "fire_event_filter"
-CONF_KNX_INDIVIDUAL_ADDRESS = "individual_address"
-CONF_KNX_MCAST_GRP = "multicast_group"
-CONF_KNX_MCAST_PORT = "multicast_port"
-CONF_KNX_STATE_UPDATER = "state_updater"
-CONF_KNX_RATE_LIMIT = "rate_limit"
-CONF_KNX_EXPOSE = "expose"
-
-SERVICE_KNX_SEND = "send"
-SERVICE_KNX_ATTR_ADDRESS = "address"
-SERVICE_KNX_ATTR_PAYLOAD = "payload"
-SERVICE_KNX_ATTR_TYPE = "type"
+_KNX_YAML_CONFIG: Final = "knx_yaml_config"
 
 CONFIG_SCHEMA = vol.Schema(
     {
-        DOMAIN: vol.Schema(
-            {
-                vol.Optional(CONF_KNX_CONFIG): cv.string,
-                vol.Exclusive(
-                    CONF_KNX_ROUTING, "connection_type"
-                ): ConnectionSchema.ROUTING_SCHEMA,
-                vol.Exclusive(
-                    CONF_KNX_TUNNELING, "connection_type"
-                ): ConnectionSchema.TUNNELING_SCHEMA,
-                vol.Inclusive(CONF_KNX_FIRE_EVENT, "fire_ev"): cv.boolean,
-                vol.Inclusive(CONF_KNX_FIRE_EVENT_FILTER, "fire_ev"): vol.All(
-                    cv.ensure_list, [cv.string]
-                ),
-                vol.Optional(
-                    CONF_KNX_INDIVIDUAL_ADDRESS, default=XKNX.DEFAULT_ADDRESS
-                ): cv.string,
-                vol.Optional(CONF_KNX_MCAST_GRP, default=DEFAULT_MCAST_GRP): cv.string,
-                vol.Optional(CONF_KNX_MCAST_PORT, default=DEFAULT_MCAST_PORT): cv.port,
-                vol.Optional(CONF_KNX_STATE_UPDATER, default=True): cv.boolean,
-                vol.Optional(CONF_KNX_RATE_LIMIT, default=20): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=100)
-                ),
-                vol.Optional(CONF_KNX_EXPOSE): vol.All(
-                    cv.ensure_list, [ExposeSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.cover.value): vol.All(
-                    cv.ensure_list, [CoverSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.binary_sensor.value): vol.All(
-                    cv.ensure_list, [BinarySensorSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.light.value): vol.All(
-                    cv.ensure_list, [LightSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.climate.value): vol.All(
-                    cv.ensure_list, [ClimateSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.notify.value): vol.All(
-                    cv.ensure_list, [NotifySchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.switch.value): vol.All(
-                    cv.ensure_list, [SwitchSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.sensor.value): vol.All(
-                    cv.ensure_list, [SensorSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.scene.value): vol.All(
-                    cv.ensure_list, [SceneSchema.SCHEMA]
-                ),
-                vol.Optional(SupportedPlatforms.weather.value): vol.All(
-                    cv.ensure_list, [WeatherSchema.SCHEMA]
-                ),
-            }
+        DOMAIN: vol.All(
+            vol.Schema(
+                {
+                    **EventSchema.SCHEMA,
+                    **ExposeSchema.platform_node(),
+                    **BinarySensorSchema.platform_node(),
+                    **ButtonSchema.platform_node(),
+                    **ClimateSchema.platform_node(),
+                    **CoverSchema.platform_node(),
+                    **DateSchema.platform_node(),
+                    **DateTimeSchema.platform_node(),
+                    **FanSchema.platform_node(),
+                    **LightSchema.platform_node(),
+                    **NotifySchema.platform_node(),
+                    **NumberSchema.platform_node(),
+                    **SceneSchema.platform_node(),
+                    **SelectSchema.platform_node(),
+                    **SensorSchema.platform_node(),
+                    **SwitchSchema.platform_node(),
+                    **TextSchema.platform_node(),
+                    **TimeSchema.platform_node(),
+                    **WeatherSchema.platform_node(),
+                }
+            ),
         )
     },
     extra=vol.ALLOW_EXTRA,
 )
 
-SERVICE_KNX_SEND_SCHEMA = vol.Any(
-    vol.Schema(
-        {
-            vol.Required(SERVICE_KNX_ATTR_ADDRESS): cv.string,
-            vol.Required(SERVICE_KNX_ATTR_PAYLOAD): cv.match_all,
-            vol.Required(SERVICE_KNX_ATTR_TYPE): vol.Any(int, float, str),
-        }
-    ),
-    vol.Schema(
-        # without type given payload is treated as raw bytes
-        {
-            vol.Required(SERVICE_KNX_ATTR_ADDRESS): cv.string,
-            vol.Required(SERVICE_KNX_ATTR_PAYLOAD): vol.Any(
-                cv.positive_int, [cv.positive_int]
-            ),
-        }
-    ),
-)
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Start the KNX integration."""
+    hass.data[DATA_HASS_CONFIG] = config
+    if (conf := config.get(DOMAIN)) is not None:
+        hass.data[_KNX_YAML_CONFIG] = dict(conf)
+
+    async_setup_services(hass)
+    return True
 
 
-async def async_setup(hass, config):
-    """Set up the KNX component."""
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Load a config entry."""
+    # `_KNX_YAML_CONFIG` is only set in async_setup.
+    # It's None when reloading the integration or no `knx` key in configuration.yaml
+    config = hass.data.pop(_KNX_YAML_CONFIG, None)
+    if config is None:
+        _conf = await async_integration_yaml_config(hass, DOMAIN)
+        if not _conf or DOMAIN not in _conf:
+            # generate defaults
+            config = CONFIG_SCHEMA({DOMAIN: {}})[DOMAIN]
+        else:
+            config = _conf[DOMAIN]
     try:
-        hass.data[DOMAIN] = KNXModule(hass, config)
-        hass.data[DOMAIN].async_create_exposures()
-        await hass.data[DOMAIN].start()
+        knx_module = KNXModule(hass, config, entry)
+        await knx_module.start()
     except XKNXException as ex:
-        _LOGGER.warning("Could not connect to KNX interface: %s", ex)
-        hass.components.persistent_notification.async_create(
-            f"Could not connect to KNX interface: <br><b>{ex}</b>", title="KNX"
-        )
+        raise ConfigEntryNotReady from ex
 
-    for platform in SupportedPlatforms:
-        if platform.value in config[DOMAIN]:
-            for device_config in config[DOMAIN][platform.value]:
-                create_knx_device(platform, hass.data[DOMAIN].xknx, device_config)
+    hass.data[KNX_MODULE_KEY] = knx_module
 
-    # We need to wait until all entities are loaded into the device list since they could also be created from other platforms
-    for platform in SupportedPlatforms:
-        hass.async_create_task(
-            discovery.async_load_platform(hass, platform.value, DOMAIN, {}, config)
-        )
-
-    if not hass.data[DOMAIN].xknx.devices:
-        _LOGGER.warning(
-            "No KNX devices are configured. Please read "
-            "https://www.home-assistant.io/blog/2020/09/17/release-115/#breaking-changes"
-        )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_KNX_SEND,
-        hass.data[DOMAIN].service_send_to_knx_bus,
-        schema=SERVICE_KNX_SEND_SCHEMA,
+    if CONF_KNX_EXPOSE in config:
+        for expose_config in config[CONF_KNX_EXPOSE]:
+            knx_module.exposures.append(
+                create_knx_exposure(hass, knx_module.xknx, expose_config)
+            )
+    configured_platforms_yaml = {
+        platform for platform in SUPPORTED_PLATFORMS_YAML if platform in config
+    }
+    await hass.config_entries.async_forward_entry_setups(
+        entry,
+        {
+            Platform.SENSOR,  # always forward sensor for system entities (telegram counter, etc.)
+            *SUPPORTED_PLATFORMS_UI,  # forward all platforms that support UI entity management
+            *configured_platforms_yaml,  # forward yaml-only managed platforms on demand,
+        },
     )
 
-    async def reload_service_handler(service_call: ServiceCallType) -> None:
-        """Remove all KNX components and load new ones from config."""
-
-        # First check for config file. If for some reason it is no longer there
-        # or knx is no longer mentioned, stop the reload.
-        config = await async_integration_yaml_config(hass, DOMAIN)
-
-        if not config or DOMAIN not in config:
-            return
-
-        await hass.data[DOMAIN].xknx.stop()
-
-        await asyncio.gather(
-            *[platform.async_reset() for platform in async_get_platforms(hass, DOMAIN)]
-        )
-
-        await async_setup(hass, config)
-
-    async_register_admin_service(
-        hass, DOMAIN, SERVICE_RELOAD, reload_service_handler, schema=vol.Schema({})
-    )
+    await register_panel(hass)
 
     return True
 
 
-class KNXModule:
-    """Representation of KNX Object."""
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unloading the KNX platforms."""
+    knx_module = hass.data.get(KNX_MODULE_KEY)
+    if not knx_module:
+        #  if not loaded directly return
+        return True
 
-    def __init__(self, hass, config):
-        """Initialize of KNX module."""
-        self.hass = hass
-        self.config = config
-        self.connected = False
-        self.init_xknx()
-        self.register_callbacks()
-        self.exposures = []
+    for exposure in knx_module.exposures:
+        exposure.async_remove()
 
-    def init_xknx(self):
-        """Initialize of KNX object."""
-        self.xknx = XKNX(
-            config=self.config_file(),
-            own_address=self.config[DOMAIN][CONF_KNX_INDIVIDUAL_ADDRESS],
-            rate_limit=self.config[DOMAIN][CONF_KNX_RATE_LIMIT],
-            multicast_group=self.config[DOMAIN][CONF_KNX_MCAST_GRP],
-            multicast_port=self.config[DOMAIN][CONF_KNX_MCAST_PORT],
-            connection_config=self.connection_config(),
-            state_updater=self.config[DOMAIN][CONF_KNX_STATE_UPDATER],
-        )
+    configured_platforms_yaml = {
+        platform
+        for platform in SUPPORTED_PLATFORMS_YAML
+        if platform in knx_module.config_yaml
+    }
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry,
+        {
+            Platform.SENSOR,  # always unload system entities (telegram counter, etc.)
+            *SUPPORTED_PLATFORMS_UI,  # unload all platforms that support UI entity management
+            *configured_platforms_yaml,  # unload yaml-only managed platforms if configured,
+        },
+    )
+    if unload_ok:
+        await knx_module.stop()
+        hass.data.pop(DOMAIN)
 
-    async def start(self):
-        """Start KNX object. Connect to tunneling or Routing device."""
-        await self.xknx.start()
-        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self.stop)
-        self.connected = True
-
-    async def stop(self, event):
-        """Stop KNX object. Disconnect from tunneling or Routing device."""
-        await self.xknx.stop()
-
-    def config_file(self):
-        """Resolve and return the full path of xknx.yaml if configured."""
-        config_file = self.config[DOMAIN].get(CONF_KNX_CONFIG)
-        if not config_file:
-            return None
-        if not config_file.startswith("/"):
-            return self.hass.config.path(config_file)
-        return config_file
-
-    def connection_config(self):
-        """Return the connection_config."""
-        if CONF_KNX_TUNNELING in self.config[DOMAIN]:
-            return self.connection_config_tunneling()
-        if CONF_KNX_ROUTING in self.config[DOMAIN]:
-            return self.connection_config_routing()
-        # config from xknx.yaml always has priority later on
-        return ConnectionConfig()
-
-    def connection_config_routing(self):
-        """Return the connection_config if routing is configured."""
-        local_ip = self.config[DOMAIN][CONF_KNX_ROUTING].get(
-            ConnectionSchema.CONF_KNX_LOCAL_IP
-        )
-        return ConnectionConfig(
-            connection_type=ConnectionType.ROUTING, local_ip=local_ip
-        )
-
-    def connection_config_tunneling(self):
-        """Return the connection_config if tunneling is configured."""
-        gateway_ip = self.config[DOMAIN][CONF_KNX_TUNNELING][CONF_HOST]
-        gateway_port = self.config[DOMAIN][CONF_KNX_TUNNELING][CONF_PORT]
-        local_ip = self.config[DOMAIN][CONF_KNX_TUNNELING].get(
-            ConnectionSchema.CONF_KNX_LOCAL_IP
-        )
-        return ConnectionConfig(
-            connection_type=ConnectionType.TUNNELING,
-            gateway_ip=gateway_ip,
-            gateway_port=gateway_port,
-            local_ip=local_ip,
-            auto_reconnect=True,
-        )
-
-    def register_callbacks(self):
-        """Register callbacks within XKNX object."""
-        if (
-            CONF_KNX_FIRE_EVENT in self.config[DOMAIN]
-            and self.config[DOMAIN][CONF_KNX_FIRE_EVENT]
-        ):
-            address_filters = list(
-                map(AddressFilter, self.config[DOMAIN][CONF_KNX_FIRE_EVENT_FILTER])
-            )
-            self.xknx.telegram_queue.register_telegram_received_cb(
-                self.telegram_received_cb, address_filters
-            )
-
-    @callback
-    def async_create_exposures(self):
-        """Create exposures."""
-        if CONF_KNX_EXPOSE not in self.config[DOMAIN]:
-            return
-        for to_expose in self.config[DOMAIN][CONF_KNX_EXPOSE]:
-            expose_type = to_expose.get(ExposeSchema.CONF_KNX_EXPOSE_TYPE)
-            entity_id = to_expose.get(CONF_ENTITY_ID)
-            attribute = to_expose.get(ExposeSchema.CONF_KNX_EXPOSE_ATTRIBUTE)
-            default = to_expose.get(ExposeSchema.CONF_KNX_EXPOSE_DEFAULT)
-            address = to_expose.get(ExposeSchema.CONF_KNX_EXPOSE_ADDRESS)
-            if expose_type.lower() in ["time", "date", "datetime"]:
-                exposure = KNXExposeTime(self.xknx, expose_type, address)
-                exposure.async_register()
-                self.exposures.append(exposure)
-            else:
-                exposure = KNXExposeSensor(
-                    self.hass,
-                    self.xknx,
-                    expose_type,
-                    entity_id,
-                    attribute,
-                    default,
-                    address,
-                )
-                exposure.async_register()
-                self.exposures.append(exposure)
-
-    async def telegram_received_cb(self, telegram):
-        """Call invoked after a KNX telegram was received."""
-        data = None
-
-        # Not all telegrams have serializable data.
-        if isinstance(telegram.payload, (GroupValueWrite, GroupValueResponse)):
-            data = telegram.payload.value.value
-
-        self.hass.bus.async_fire(
-            "knx_event",
-            {
-                "data": data,
-                "destination": str(telegram.destination_address),
-                "direction": telegram.direction.value,
-                "source": str(telegram.source_address),
-                "telegramtype": telegram.payload.__class__.__name__,
-            },
-        )
-
-    async def service_send_to_knx_bus(self, call):
-        """Service for sending an arbitrary KNX message to the KNX bus."""
-        attr_payload = call.data.get(SERVICE_KNX_ATTR_PAYLOAD)
-        attr_address = call.data.get(SERVICE_KNX_ATTR_ADDRESS)
-        attr_type = call.data.get(SERVICE_KNX_ATTR_TYPE)
-
-        def calculate_payload(attr_payload):
-            """Calculate payload depending on type of attribute."""
-            if attr_type is not None:
-                transcoder = DPTBase.parse_transcoder(attr_type)
-                if transcoder is None:
-                    raise ValueError(f"Invalid type for knx.send service: {attr_type}")
-                return DPTArray(transcoder.to_knx(attr_payload))
-            if isinstance(attr_payload, int):
-                return DPTBinary(attr_payload)
-            return DPTArray(attr_payload)
-
-        telegram = Telegram(
-            destination_address=GroupAddress(attr_address),
-            payload=GroupValueWrite(calculate_payload(attr_payload)),
-        )
-        await self.xknx.telegrams.put(telegram)
+    return unload_ok
 
 
-class KNXExposeTime:
-    """Object to Expose Time/Date object to KNX bus."""
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove a config entry."""
 
-    def __init__(self, xknx: XKNX, expose_type: str, address: str):
-        """Initialize of Expose class."""
-        self.xknx = xknx
-        self.expose_type = expose_type
-        self.address = address
-        self.device = None
+    def remove_files(storage_dir: Path, knxkeys_filename: str | None) -> None:
+        """Remove KNX files."""
+        if knxkeys_filename is not None:
+            with contextlib.suppress(FileNotFoundError):
+                (storage_dir / knxkeys_filename).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            (storage_dir / CONFIG_STORAGE_KEY).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            (storage_dir / PROJECT_STORAGE_KEY).unlink()
+        with contextlib.suppress(FileNotFoundError):
+            (storage_dir / TELEGRAMS_STORAGE_KEY).unlink()
+        with contextlib.suppress(FileNotFoundError, OSError):
+            (storage_dir / DOMAIN).rmdir()
 
-    @callback
-    def async_register(self):
-        """Register listener."""
-        self.device = DateTime(
-            self.xknx,
-            name=self.expose_type.capitalize(),
-            broadcast_type=self.expose_type.upper(),
-            localtime=True,
-            group_address=self.address,
-        )
+    storage_dir = Path(hass.config.path(STORAGE_DIR))
+    knxkeys_filename = entry.data.get(CONF_KNX_KNXKEY_FILENAME)
+    await hass.async_add_executor_job(remove_files, storage_dir, knxkeys_filename)
 
 
-class KNXExposeSensor:
-    """Object to Expose Home Assistant entity to KNX bus."""
-
-    def __init__(self, hass, xknx, expose_type, entity_id, attribute, default, address):
-        """Initialize of Expose class."""
-        self.hass = hass
-        self.xknx = xknx
-        self.type = expose_type
-        self.entity_id = entity_id
-        self.expose_attribute = attribute
-        self.expose_default = default
-        self.address = address
-        self.device = None
-
-    @callback
-    def async_register(self):
-        """Register listener."""
-        if self.expose_attribute is not None:
-            _name = self.entity_id + "__" + self.expose_attribute
-        else:
-            _name = self.entity_id
-        self.device = ExposeSensor(
-            self.xknx,
-            name=_name,
-            group_address=self.address,
-            value_type=self.type,
-        )
-        async_track_state_change_event(
-            self.hass, [self.entity_id], self._async_entity_changed
-        )
-
-    async def _async_entity_changed(self, event):
-        """Handle entity change."""
-        new_state = event.data.get("new_state")
-        if new_state is None:
-            return
-        if new_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-            return
-
-        if self.expose_attribute is not None:
-            new_attribute = new_state.attributes.get(self.expose_attribute)
-            old_state = event.data.get("old_state")
-
-            if old_state is not None:
-                old_attribute = old_state.attributes.get(self.expose_attribute)
-                if old_attribute == new_attribute:
-                    # don't send same value sequentially
-                    return
-            await self._async_set_knx_value(new_attribute)
-        else:
-            await self._async_set_knx_value(new_state.state)
-
-    async def _async_set_knx_value(self, value):
-        """Set new value on xknx ExposeSensor."""
-        if value is None:
-            if self.expose_default is None:
-                return
-            value = self.expose_default
-
-        if self.type == "binary":
-            if value == STATE_ON:
-                value = True
-            elif value == STATE_OFF:
-                value = False
-
-        await self.device.set(value)
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: DeviceEntry
+) -> bool:
+    """Remove a config entry from a device."""
+    knx_module = hass.data[KNX_MODULE_KEY]
+    if not device_entry.identifiers.isdisjoint(
+        knx_module.interface_device.device_info["identifiers"]
+    ):
+        # can not remove interface device
+        return False
+    for entity in knx_module.config_store.get_entity_entries():
+        if entity.device_id == device_entry.id:
+            await knx_module.config_store.delete_entity(entity.entity_id)
+    return True

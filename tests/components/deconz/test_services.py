@@ -1,248 +1,338 @@
 """deCONZ service tests."""
 
-from copy import deepcopy
-from unittest.mock import Mock, patch
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 import voluptuous as vol
 
 from homeassistant.components.deconz.const import (
     CONF_BRIDGE_ID,
-    DOMAIN as DECONZ_DOMAIN,
+    CONF_MASTER_GATEWAY,
+    DOMAIN,
 )
-from homeassistant.components.deconz.gateway import get_gateway_from_config_entry
+from homeassistant.components.deconz.deconz_event import CONF_DECONZ_EVENT
 from homeassistant.components.deconz.services import (
-    DECONZ_SERVICES,
     SERVICE_CONFIGURE_DEVICE,
     SERVICE_DATA,
     SERVICE_DEVICE_REFRESH,
     SERVICE_ENTITY,
     SERVICE_FIELD,
     SERVICE_REMOVE_ORPHANED_ENTRIES,
-    async_setup_services,
-    async_unload_services,
 )
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.helpers.entity_registry import async_entries_for_config_entry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 
-from .test_gateway import BRIDGEID, DECONZ_WEB_REQUEST, setup_deconz_integration
+from .test_hub import BRIDGE_ID
 
-GROUP = {
-    "1": {
-        "id": "Group 1 id",
-        "name": "Group 1 name",
-        "type": "LightGroup",
-        "state": {},
-        "action": {},
-        "scenes": [{"id": "1", "name": "Scene 1"}],
-        "lights": ["1"],
-    }
-}
-
-LIGHT = {
-    "1": {
-        "id": "Light 1 id",
-        "name": "Light 1 name",
-        "state": {"reachable": True},
-        "type": "Light",
-        "uniqueid": "00:00:00:00:00:00:00:01-00",
-    }
-}
-
-SENSOR = {
-    "1": {
-        "id": "Sensor 1 id",
-        "name": "Sensor 1 name",
-        "type": "ZHALightLevel",
-        "state": {"lightlevel": 30000, "dark": False},
-        "config": {"reachable": True},
-        "uniqueid": "00:00:00:00:00:00:00:02-00",
-    }
-}
-
-SWITCH = {
-    "1": {
-        "id": "Switch 1 id",
-        "name": "Switch 1",
-        "type": "ZHASwitch",
-        "state": {"buttonevent": 1000, "gesture": 1},
-        "config": {"battery": 100},
-        "uniqueid": "00:00:00:00:00:00:00:03-00",
-    },
-}
+from tests.common import MockConfigEntry, async_capture_events
+from tests.test_util.aiohttp import AiohttpClientMocker
 
 
-async def test_service_setup(hass):
-    """Verify service setup works."""
-    assert DECONZ_SERVICES not in hass.data
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_register", return_value=Mock(True)
-    ) as async_register:
-        await async_setup_services(hass)
-        assert hass.data[DECONZ_SERVICES] is True
-        assert async_register.call_count == 3
-
-
-async def test_service_setup_already_registered(hass):
-    """Make sure that services are only registered once."""
-    hass.data[DECONZ_SERVICES] = True
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_register", return_value=Mock(True)
-    ) as async_register:
-        await async_setup_services(hass)
-        async_register.assert_not_called()
-
-
-async def test_service_unload(hass):
-    """Verify service unload works."""
-    hass.data[DECONZ_SERVICES] = True
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_remove", return_value=Mock(True)
-    ) as async_remove:
-        await async_unload_services(hass)
-        assert hass.data[DECONZ_SERVICES] is False
-        assert async_remove.call_count == 3
-
-
-async def test_service_unload_not_registered(hass):
-    """Make sure that services can only be unloaded once."""
-    with patch(
-        "homeassistant.core.ServiceRegistry.async_remove", return_value=Mock(True)
-    ) as async_remove:
-        await async_unload_services(hass)
-        assert DECONZ_SERVICES not in hass.data
-        async_remove.assert_not_called()
-
-
-async def test_configure_service_with_field(hass):
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_field(
+    hass: HomeAssistant,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+) -> None:
     """Test that service invokes pydeconz with the correct path and data."""
-    await setup_deconz_integration(hass)
-
     data = {
-        SERVICE_FIELD: "/light/2",
-        CONF_BRIDGE_ID: BRIDGEID,
+        SERVICE_FIELD: "/lights/2",
+        CONF_BRIDGE_ID: BRIDGE_ID,
         SERVICE_DATA: {"on": True, "attr1": 10, "attr2": 20},
     }
 
-    with patch("pydeconz.DeconzSession.request", return_value=Mock(True)) as put_state:
-        await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
-        )
-        await hass.async_block_till_done()
-        put_state.assert_called_with(
-            "put", "/light/2", json={"on": True, "attr1": 10, "attr2": 20}
-        )
+    aioclient_mock = mock_put_request("/lights/2")
+
+    await hass.services.async_call(
+        DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data, blocking=True
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"on": True, "attr1": 10, "attr2": 20}
 
 
-async def test_configure_service_with_entity(hass):
+@pytest.mark.parametrize(
+    "light_payload",
+    [
+        {
+            "name": "Test",
+            "state": {"reachable": True},
+            "type": "Dimmable light",
+            "uniqueid": "00:00:00:00:00:00:00:01-00",
+        }
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_entity(
+    hass: HomeAssistant,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+) -> None:
     """Test that service invokes pydeconz with the correct path and data."""
-    config_entry = await setup_deconz_integration(hass)
-    gateway = get_gateway_from_config_entry(hass, config_entry)
-
-    gateway.deconz_ids["light.test"] = "/light/1"
     data = {
         SERVICE_ENTITY: "light.test",
         SERVICE_DATA: {"on": True, "attr1": 10, "attr2": 20},
     }
+    aioclient_mock = mock_put_request("/lights/0")
 
-    with patch("pydeconz.DeconzSession.request", return_value=Mock(True)) as put_state:
-        await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
-        )
-        await hass.async_block_till_done()
-        put_state.assert_called_with(
-            "put", "/light/1", json={"on": True, "attr1": 10, "attr2": 20}
-        )
+    await hass.services.async_call(
+        DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data, blocking=True
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"on": True, "attr1": 10, "attr2": 20}
 
 
-async def test_configure_service_with_entity_and_field(hass):
+@pytest.mark.parametrize(
+    "light_payload",
+    [
+        {
+            "name": "Test",
+            "state": {"reachable": True},
+            "type": "Dimmable light",
+            "uniqueid": "00:00:00:00:00:00:00:01-00",
+        }
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_entity_and_field(
+    hass: HomeAssistant,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+) -> None:
     """Test that service invokes pydeconz with the correct path and data."""
-    config_entry = await setup_deconz_integration(hass)
-    gateway = get_gateway_from_config_entry(hass, config_entry)
-
-    gateway.deconz_ids["light.test"] = "/light/1"
     data = {
         SERVICE_ENTITY: "light.test",
         SERVICE_FIELD: "/state",
         SERVICE_DATA: {"on": True, "attr1": 10, "attr2": 20},
     }
+    aioclient_mock = mock_put_request("/lights/0/state")
 
-    with patch("pydeconz.DeconzSession.request", return_value=Mock(True)) as put_state:
-        await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
-        )
-        await hass.async_block_till_done()
-        put_state.assert_called_with(
-            "put", "/light/1/state", json={"on": True, "attr1": 10, "attr2": 20}
-        )
+    await hass.services.async_call(
+        DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data, blocking=True
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"on": True, "attr1": 10, "attr2": 20}
 
 
-async def test_configure_service_with_faulty_field(hass):
-    """Test that service invokes pydeconz with the correct path and data."""
-    await setup_deconz_integration(hass)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_faulty_bridgeid(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that service fails on a bad bridge id."""
+    aioclient_mock.clear_requests()
 
+    data = {
+        CONF_BRIDGE_ID: "Bad bridge id",
+        SERVICE_FIELD: "/lights/1",
+        SERVICE_DATA: {"on": True},
+    }
+
+    await hass.services.async_call(DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data)
+    await hass.async_block_till_done()
+
+    assert len(aioclient_mock.mock_calls) == 0
+
+
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_faulty_field(hass: HomeAssistant) -> None:
+    """Test that service fails on a bad field."""
     data = {SERVICE_FIELD: "light/2", SERVICE_DATA: {}}
 
     with pytest.raises(vol.Invalid):
         await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
+            DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
         )
-        await hass.async_block_till_done()
 
 
-async def test_configure_service_with_faulty_entity(hass):
-    """Test that service invokes pydeconz with the correct path and data."""
-    await setup_deconz_integration(hass)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_configure_service_with_faulty_entity(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that service on a non existing entity."""
+    aioclient_mock.clear_requests()
 
     data = {
         SERVICE_ENTITY: "light.nonexisting",
         SERVICE_DATA: {},
     }
 
-    with patch("pydeconz.DeconzSession.request", return_value=Mock(True)) as put_state:
-        await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data
-        )
-        await hass.async_block_till_done()
-        put_state.assert_not_called()
+    await hass.services.async_call(DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data)
+    await hass.async_block_till_done()
+
+    assert len(aioclient_mock.mock_calls) == 0
 
 
-async def test_service_refresh_devices(hass):
-    """Test that service can refresh devices."""
-    config_entry = await setup_deconz_integration(hass)
-    gateway = get_gateway_from_config_entry(hass, config_entry)
+@pytest.mark.parametrize("config_entry_options", [{CONF_MASTER_GATEWAY: False}])
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_calling_service_with_no_master_gateway_fails(
+    hass: HomeAssistant, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Test that service call fails when no master gateway exist."""
+    aioclient_mock.clear_requests()
 
-    data = {CONF_BRIDGE_ID: BRIDGEID}
-
-    with patch(
-        "pydeconz.DeconzSession.request",
-        return_value={"groups": GROUP, "lights": LIGHT, "sensors": SENSOR},
-    ):
-        await hass.services.async_call(
-            DECONZ_DOMAIN, SERVICE_DEVICE_REFRESH, service_data=data
-        )
-        await hass.async_block_till_done()
-
-    assert gateway.deconz_ids == {
-        "light.group_1_name": "/groups/1",
-        "light.light_1_name": "/lights/1",
-        "scene.group_1_name_scene_1": "/groups/1/scenes/1",
-        "sensor.sensor_1_name": "/sensors/1",
+    data = {
+        SERVICE_FIELD: "/lights/1",
+        SERVICE_DATA: {"on": True},
     }
 
+    await hass.services.async_call(DOMAIN, SERVICE_CONFIGURE_DEVICE, service_data=data)
+    await hass.async_block_till_done()
 
-async def test_remove_orphaned_entries_service(hass):
+    assert len(aioclient_mock.mock_calls) == 0
+
+
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_service_refresh_devices(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    deconz_payload: dict[str, Any],
+    mock_requests: Callable[[], None],
+) -> None:
+    """Test that service can refresh devices."""
+    assert len(hass.states.async_all()) == 0
+
+    aioclient_mock.clear_requests()
+
+    deconz_payload |= {
+        "groups": {
+            "1": {
+                "id": "Group 1 id",
+                "name": "Group 1 name",
+                "type": "LightGroup",
+                "state": {},
+                "action": {},
+                "scenes": [{"id": "1", "name": "Scene 1"}],
+                "lights": ["1"],
+            }
+        },
+        "lights": {
+            "1": {
+                "name": "Light 1 name",
+                "state": {"reachable": True},
+                "type": "Dimmable light",
+                "uniqueid": "00:00:00:00:00:00:00:01-00",
+            }
+        },
+        "sensors": {
+            "1": {
+                "name": "Sensor 1 name",
+                "type": "ZHALightLevel",
+                "state": {"lightlevel": 30000, "dark": False},
+                "config": {"reachable": True},
+                "uniqueid": "00:00:00:00:00:00:00:02-00",
+            }
+        },
+    }
+    mock_requests()
+
+    await hass.services.async_call(
+        DOMAIN, SERVICE_DEVICE_REFRESH, service_data={CONF_BRIDGE_ID: BRIDGE_ID}
+    )
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 5
+
+
+@pytest.mark.parametrize(
+    "sensor_payload",
+    [
+        {
+            "name": "Switch 1",
+            "type": "ZHASwitch",
+            "state": {"buttonevent": 1000},
+            "config": {"battery": 100},
+            "uniqueid": "00:00:00:00:00:00:00:01-00",
+        }
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_service_refresh_devices_trigger_no_state_update(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    deconz_payload: dict[str, Any],
+    mock_requests,
+) -> None:
+    """Verify that gateway.ignore_state_updates are honored."""
+    assert len(hass.states.async_all()) == 1
+
+    captured_events = async_capture_events(hass, CONF_DECONZ_EVENT)
+
+    aioclient_mock.clear_requests()
+
+    deconz_payload |= {
+        "groups": {
+            "1": {
+                "id": "Group 1 id",
+                "name": "Group 1 name",
+                "type": "LightGroup",
+                "state": {},
+                "action": {},
+                "scenes": [{"id": "1", "name": "Scene 1"}],
+                "lights": ["1"],
+            }
+        },
+        "lights": {
+            "1": {
+                "name": "Light 1 name",
+                "state": {"reachable": True},
+                "type": "Dimmable light",
+                "uniqueid": "00:00:00:00:00:00:00:01-00",
+            }
+        },
+        "sensors": {
+            "0": {
+                "name": "Switch 1",
+                "type": "ZHASwitch",
+                "state": {"buttonevent": 1000},
+                "config": {"battery": 100},
+                "uniqueid": "00:00:00:00:00:00:00:01-00",
+            }
+        },
+    }
+    mock_requests()
+
+    await hass.services.async_call(
+        DOMAIN, SERVICE_DEVICE_REFRESH, service_data={CONF_BRIDGE_ID: BRIDGE_ID}
+    )
+    await hass.async_block_till_done()
+
+    assert len(hass.states.async_all()) == 5
+    assert len(captured_events) == 0
+
+
+@pytest.mark.parametrize(
+    "light_payload",
+    [
+        {
+            "name": "Light 0 name",
+            "state": {"reachable": True},
+            "type": "Dimmable light",
+            "uniqueid": "00:00:00:00:00:00:00:01-00",
+        }
+    ],
+)
+@pytest.mark.parametrize(
+    "sensor_payload",
+    [
+        {
+            "name": "Switch 1",
+            "type": "ZHASwitch",
+            "state": {"buttonevent": 1000, "gesture": 1},
+            "config": {"battery": 100},
+            "uniqueid": "00:00:00:00:00:00:00:03-00",
+        }
+    ],
+)
+async def test_remove_orphaned_entries_service(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    config_entry_setup: MockConfigEntry,
+) -> None:
     """Test service works and also don't remove more than expected."""
-    data = deepcopy(DECONZ_WEB_REQUEST)
-    data["lights"] = deepcopy(LIGHT)
-    data["sensors"] = deepcopy(SWITCH)
-    config_entry = await setup_deconz_integration(hass, get_state_response=data)
-
-    data = {CONF_BRIDGE_ID: BRIDGEID}
-
-    device_registry = await hass.helpers.device_registry.async_get_registry()
     device = device_registry.async_get_or_create(
-        config_entry_id=config_entry.entry_id, identifiers={("mac", "123")}
+        config_entry_id=config_entry_setup.entry_id,
+        identifiers={(DOMAIN, BRIDGE_ID)},
+    )
+
+    device_registry.async_get_or_create(
+        config_entry_id=config_entry_setup.entry_id,
+        identifiers={(DOMAIN, "orphaned")},
     )
 
     assert (
@@ -250,31 +340,34 @@ async def test_remove_orphaned_entries_service(hass):
             [
                 entry
                 for entry in device_registry.devices.values()
-                if config_entry.entry_id in entry.config_entries
+                if config_entry_setup.entry_id in entry.config_entries
             ]
         )
-        == 5  # Host, gateway, light, switch and orphan
+        == 4  # Gateway, light, switch and orphan
     )
 
-    entity_registry = await hass.helpers.entity_registry.async_get_registry()
     entity_registry.async_get_or_create(
         SENSOR_DOMAIN,
-        DECONZ_DOMAIN,
+        DOMAIN,
         "12345",
         suggested_object_id="Orphaned sensor",
-        config_entry=config_entry,
+        config_entry=config_entry_setup,
         device_id=device.id,
     )
 
     assert (
-        len(async_entries_for_config_entry(entity_registry, config_entry.entry_id))
+        len(
+            er.async_entries_for_config_entry(
+                entity_registry, config_entry_setup.entry_id
+            )
+        )
         == 3  # Light, switch battery and orphan
     )
 
     await hass.services.async_call(
-        DECONZ_DOMAIN,
+        DOMAIN,
         SERVICE_REMOVE_ORPHANED_ENTRIES,
-        service_data=data,
+        service_data={CONF_BRIDGE_ID: BRIDGE_ID},
     )
     await hass.async_block_till_done()
 
@@ -283,13 +376,17 @@ async def test_remove_orphaned_entries_service(hass):
             [
                 entry
                 for entry in device_registry.devices.values()
-                if config_entry.entry_id in entry.config_entries
+                if config_entry_setup.entry_id in entry.config_entries
             ]
         )
-        == 4  # Host, gateway, light and switch
+        == 3  # Gateway, light and switch
     )
 
     assert (
-        len(async_entries_for_config_entry(entity_registry, config_entry.entry_id))
+        len(
+            er.async_entries_for_config_entry(
+                entity_registry, config_entry_setup.entry_id
+            )
+        )
         == 2  # Light and switch battery
     )

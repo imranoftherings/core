@@ -1,11 +1,18 @@
 """Harmony data object which contains the Harmony Client."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 import logging
-from typing import Iterable
 
 from aioharmony.const import ClientCallbackType, SendCommandDevice
 import aioharmony.exceptions as aioexc
 from aioharmony.harmonyapi import HarmonyAPI as HarmonyClient
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import ACTIVITY_POWER_OFF
 from .subscriber import HarmonySubscriberMixin
@@ -13,53 +20,45 @@ from .subscriber import HarmonySubscriberMixin
 _LOGGER = logging.getLogger(__name__)
 
 
+type HarmonyConfigEntry = ConfigEntry[HarmonyData]
+
+
 class HarmonyData(HarmonySubscriberMixin):
     """HarmonyData registers for Harmony hub updates."""
 
-    def __init__(self, hass, address: str, name: str, unique_id: str):
+    _client: HarmonyClient
+
+    def __init__(
+        self, hass: HomeAssistant, address: str, name: str, unique_id: str | None
+    ) -> None:
         """Initialize a data object."""
         super().__init__(hass)
-        self._name = name
+        self.name = name
         self._unique_id = unique_id
         self._available = False
-
-        callbacks = {
-            "config_updated": self._config_updated,
-            "connect": self._connected,
-            "disconnect": self._disconnected,
-            "new_activity_starting": self._activity_starting,
-            "new_activity": self._activity_started,
-        }
-        self._client = HarmonyClient(
-            ip_address=address, callbacks=ClientCallbackType(**callbacks)
-        )
+        self._address = address
 
     @property
-    def activity_names(self):
-        """Names of all the remotes activities."""
+    def activities(self):
+        """List of all non-poweroff activity objects."""
         activity_infos = self._client.config.get("activity", [])
-        activities = [activity["label"] for activity in activity_infos]
+        return [
+            info
+            for info in activity_infos
+            if info["label"] is not None and info["label"] != ACTIVITY_POWER_OFF
+        ]
 
-        # Remove both ways of representing PowerOff
-        if None in activities:
-            activities.remove(None)
-        if ACTIVITY_POWER_OFF in activities:
-            activities.remove(ACTIVITY_POWER_OFF)
-
-        return activities
+    @property
+    def activity_names(self) -> list[str]:
+        """Names of all the remotes activities."""
+        activity_infos = self.activities
+        return [activity["label"] for activity in activity_infos]
 
     @property
     def device_names(self):
         """Names of all of the devices connected to the hub."""
         device_infos = self._client.config.get("device", [])
-        devices = [device["label"] for device in device_infos]
-
-        return devices
-
-    @property
-    def name(self):
-        """Return the Harmony device's name."""
-        return self._name
+        return [device["label"] for device in device_infos]
 
     @property
     def unique_id(self):
@@ -83,43 +82,65 @@ class HarmonyData(HarmonySubscriberMixin):
         """Return the current activity tuple."""
         return self._client.current_activity
 
-    def device_info(self, domain: str):
+    def device_info(self, domain: str) -> DeviceInfo:
         """Return hub device info."""
         model = "Harmony Hub"
         if "ethernetStatus" in self._client.hub_config.info:
             model = "Harmony Hub Pro 2400"
-        return {
-            "identifiers": {(domain, self.unique_id)},
-            "manufacturer": "Logitech",
-            "sw_version": self._client.hub_config.info.get(
+        return DeviceInfo(
+            identifiers={(domain, self.unique_id)},
+            manufacturer="Logitech",
+            model=model,
+            name=self.name,
+            sw_version=self._client.hub_config.info.get(
                 "hubSwVersion", self._client.fw_version
             ),
-            "name": self.name,
-            "model": model,
-        }
+            configuration_url="https://www.logitech.com/en-us/my-account",
+        )
 
-    async def connect(self) -> bool:
+    async def connect(self) -> None:
         """Connect to the Harmony Hub."""
-        _LOGGER.debug("%s: Connecting", self._name)
-        try:
-            if not await self._client.connect():
-                _LOGGER.warning("%s: Unable to connect to HUB", self._name)
-                await self._client.close()
-                return False
-        except aioexc.TimeOut:
-            _LOGGER.warning("%s: Connection timed-out", self._name)
-            return False
-        return True
+        _LOGGER.debug("%s: Connecting", self.name)
 
-    async def shutdown(self):
+        callbacks = {
+            "config_updated": self._config_updated,
+            "connect": self._connected,
+            "disconnect": self._disconnected,
+            "new_activity_starting": self._activity_starting,
+            "new_activity": self._activity_started,
+        }
+        self._client = HarmonyClient(
+            ip_address=self._address, callbacks=ClientCallbackType(**callbacks)
+        )
+
+        connected = False
+        try:
+            connected = await self._client.connect()
+        except (TimeoutError, aioexc.TimeOut) as err:
+            await self._client.close()
+            raise ConfigEntryNotReady(
+                f"{self.name}: Connection timed-out to {self._address}:8088"
+            ) from err
+        except (ValueError, AttributeError) as err:
+            await self._client.close()
+            raise ConfigEntryNotReady(
+                f"{self.name}: Error {err} while connected HUB at: {self._address}:8088"
+            ) from err
+        if not connected:
+            await self._client.close()
+            raise ConfigEntryNotReady(
+                f"{self.name}: Unable to connect to HUB at: {self._address}:8088"
+            )
+
+    async def shutdown(self) -> None:
         """Close connection on shutdown."""
-        _LOGGER.debug("%s: Closing Harmony Hub", self._name)
+        _LOGGER.debug("%s: Closing Harmony Hub", self.name)
         try:
             await self._client.close()
         except aioexc.TimeOut:
-            _LOGGER.warning("%s: Disconnect timed-out", self._name)
+            _LOGGER.warning("%s: Disconnect timed-out", self.name)
 
-    async def async_start_activity(self, activity: str):
+    async def async_start_activity(self, activity: str) -> None:
         """Start an activity from the Harmony device."""
 
         if not activity:
@@ -155,12 +176,14 @@ class HarmonyData(HarmonySubscriberMixin):
             )
             return
 
+        await self.async_lock_start_activity()
         try:
             await self._client.start_activity(activity_id)
         except aioexc.TimeOut:
             _LOGGER.error("%s: Starting activity %s timed-out", self.name, activity)
+            self.async_unlock_start_activity()
 
-    async def async_power_off(self):
+    async def async_power_off(self) -> None:
         """Start the PowerOff activity."""
         _LOGGER.debug("%s: Turn Off", self.name)
         try:
@@ -175,7 +198,7 @@ class HarmonyData(HarmonySubscriberMixin):
         num_repeats: int,
         delay_secs: float,
         hold_secs: float,
-    ):
+    ) -> None:
         """Send a list of commands to one device."""
         device_id = None
         if device.isdigit():
@@ -194,8 +217,10 @@ class HarmonyData(HarmonySubscriberMixin):
             return
 
         _LOGGER.debug(
-            "Sending commands to device %s holding for %s seconds "
-            "with a delay of %s seconds",
+            (
+                "Sending commands to device %s holding for %s seconds "
+                "with a delay of %s seconds"
+            ),
             device,
             hold_secs,
             delay_secs,
@@ -228,7 +253,7 @@ class HarmonyData(HarmonySubscriberMixin):
                 result.msg,
             )
 
-    async def change_channel(self, channel: int):
+    async def change_channel(self, channel: int) -> None:
         """Change the channel using Harmony remote."""
         _LOGGER.debug("%s: Changing channel to %s", self.name, channel)
         try:
@@ -247,5 +272,5 @@ class HarmonyData(HarmonySubscriberMixin):
         except aioexc.TimeOut:
             _LOGGER.error("%s: Syncing hub with Harmony cloud timed-out", self.name)
             return False
-        else:
-            return True
+
+        return True

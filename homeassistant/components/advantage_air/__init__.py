@@ -1,31 +1,41 @@
 """Advantage Air climate integration."""
 
-import asyncio
 from datetime import timedelta
 import logging
 
 from advantage_air import ApiError, advantage_air
 
-from homeassistant.const import CONF_IP_ADDRESS, CONF_PORT
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_IP_ADDRESS, CONF_PORT, Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import ADVANTAGE_AIR_RETRY, DOMAIN
+from .const import ADVANTAGE_AIR_RETRY
+from .models import AdvantageAirData
+
+type AdvantageAirDataConfigEntry = ConfigEntry[AdvantageAirData]
 
 ADVANTAGE_AIR_SYNC_INTERVAL = 15
-ADVANTAGE_AIR_PLATFORMS = ["climate", "cover", "binary_sensor", "sensor", "switch"]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.CLIMATE,
+    Platform.COVER,
+    Platform.LIGHT,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.UPDATE,
+]
 
 _LOGGER = logging.getLogger(__name__)
+REQUEST_REFRESH_DELAY = 0.5
 
 
-async def async_setup(hass, config):
-    """Set up Advantage Air integration."""
-    hass.data[DOMAIN] = {}
-    return True
-
-
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(
+    hass: HomeAssistant, entry: AdvantageAirDataConfigEntry
+) -> bool:
     """Set up Advantage Air config."""
     ip_address = entry.data[CONF_IP_ADDRESS]
     port = entry.data[CONF_PORT]
@@ -45,48 +55,26 @@ async def async_setup_entry(hass, entry):
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
+        config_entry=entry,
         name="Advantage Air",
         update_method=async_get,
         update_interval=timedelta(seconds=ADVANTAGE_AIR_SYNC_INTERVAL),
+        request_refresh_debouncer=Debouncer(
+            hass, _LOGGER, cooldown=REQUEST_REFRESH_DELAY, immediate=False
+        ),
     )
 
-    async def async_change(change):
-        try:
-            if await api.async_change(change):
-                await coordinator.async_refresh()
-        except ApiError as err:
-            _LOGGER.warning(err)
+    await coordinator.async_config_entry_first_refresh()
 
-    await coordinator.async_refresh()
+    entry.runtime_data = AdvantageAirData(coordinator, api)
 
-    if not coordinator.data:
-        raise ConfigEntryNotReady
-
-    hass.data[DOMAIN][entry.entry_id] = {
-        "coordinator": coordinator,
-        "async_change": async_change,
-    }
-
-    for platform in ADVANTAGE_AIR_PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, platform)
-        )
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(
+    hass: HomeAssistant, entry: AdvantageAirDataConfigEntry
+) -> bool:
     """Unload Advantage Air Config."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in ADVANTAGE_AIR_PLATFORMS
-            ]
-        )
-    )
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

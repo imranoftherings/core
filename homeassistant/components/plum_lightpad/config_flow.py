@@ -1,22 +1,24 @@
 """Config flow for Plum Lightpad."""
+
+from __future__ import annotations
+
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 from aiohttp import ContentTypeError
 from requests.exceptions import ConnectTimeout, HTTPError
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN  # pylint: disable=unused-import
+from .const import DOMAIN
 from .utils import load_plum
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class PlumLightpadConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class PlumLightpadConfigFlow(ConfigFlow, domain=DOMAIN):
     """Config flow for Plum Lightpad integration."""
 
     VERSION = 1
@@ -34,8 +36,8 @@ class PlumLightpadConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_user(
-        self, user_input: Optional[ConfigType] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user or redirected to by import."""
         if not user_input:
             return self._show_form()
@@ -56,9 +58,3 @@ class PlumLightpadConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title=username, data={CONF_USERNAME: username, CONF_PASSWORD: password}
         )
-
-    async def async_step_import(
-        self, import_config: Optional[ConfigType]
-    ) -> Dict[str, Any]:
-        """Import a config entry from configuration.yaml."""
-        return await self.async_step_user(import_config)

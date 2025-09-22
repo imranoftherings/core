@@ -1,78 +1,128 @@
 """Config flow to configure the devolo home control integration."""
-import logging
 
-from devolo_home_control_api.mydevolo import Mydevolo
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import callback
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
-from .const import (  # pylint:disable=unused-import
-    CONF_MYDEVOLO,
-    DEFAULT_MYDEVOLO,
-    DOMAIN,
+from . import configure_mydevolo
+from .const import DOMAIN, SUPPORTED_MODEL_TYPES
+from .exceptions import CredentialsInvalid, UuidChanged
+
+DATA_SCHEMA = vol.Schema(
+    {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
 )
 
-_LOGGER = logging.getLogger(__name__)
 
-
-class DevoloHomeControlFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class DevoloHomeControlFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a devolo HomeControl config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_PUSH
 
-    def __init__(self):
-        """Initialize devolo Home Control flow."""
-        self.data_schema = {
-            vol.Required(CONF_USERNAME): str,
-            vol.Required(CONF_PASSWORD): str,
-        }
-
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
-        if self.show_advanced_options:
-            self.data_schema = {
-                vol.Required(CONF_USERNAME): str,
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                return await self._connect_mydevolo(user_input)
+            except CredentialsInvalid:
+                errors["base"] = "invalid_auth"
+
+        return self.async_show_form(
+            step_id="user", data_schema=DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_zeroconf(
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle zeroconf discovery."""
+        # Check if it is a gateway
+        if discovery_info.properties.get("MT") in SUPPORTED_MODEL_TYPES:
+            await self._async_handle_discovery_without_unique_id()
+            return await self.async_step_zeroconf_confirm()
+        return self.async_abort(reason="Not a devolo Home Control gateway.")
+
+    async def async_step_zeroconf_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initiated by zeroconf."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            try:
+                return await self._connect_mydevolo(user_input)
+            except CredentialsInvalid:
+                errors["base"] = "invalid_auth"
+
+        return self.async_show_form(
+            step_id="zeroconf_confirm", data_schema=DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle reauthentication."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow initiated by reauthentication."""
+        errors: dict[str, str] = {}
+        data_schema = vol.Schema(
+            {
+                vol.Required(CONF_USERNAME, default=self.init_data[CONF_USERNAME]): str,
                 vol.Required(CONF_PASSWORD): str,
-                vol.Required(CONF_MYDEVOLO, default=DEFAULT_MYDEVOLO): str,
             }
-        if user_input is None:
-            return self._show_form(user_input)
-        user = user_input[CONF_USERNAME]
-        password = user_input[CONF_PASSWORD]
-        mydevolo = Mydevolo()
-        mydevolo.user = user
-        mydevolo.password = password
-        if self.show_advanced_options:
-            mydevolo.url = user_input[CONF_MYDEVOLO]
-        else:
-            mydevolo.url = DEFAULT_MYDEVOLO
+        )
+
+        if user_input is not None:
+            try:
+                return await self._connect_mydevolo(user_input)
+            except CredentialsInvalid:
+                errors["base"] = "invalid_auth"
+            except UuidChanged:
+                errors["base"] = "reauth_failed"
+
+        return self.async_show_form(
+            step_id="reauth_confirm", data_schema=data_schema, errors=errors
+        )
+
+    async def _connect_mydevolo(self, user_input: dict[str, Any]) -> ConfigFlowResult:
+        """Connect to mydevolo."""
+        mydevolo = configure_mydevolo(conf=user_input)
         credentials_valid = await self.hass.async_add_executor_job(
             mydevolo.credentials_valid
         )
         if not credentials_valid:
-            return self._show_form({"base": "invalid_auth"})
-        _LOGGER.debug("Credentials valid")
+            raise CredentialsInvalid
         uuid = await self.hass.async_add_executor_job(mydevolo.uuid)
-        await self.async_set_unique_id(uuid)
-        self._abort_if_unique_id_configured()
 
-        return self.async_create_entry(
-            title="devolo Home Control",
-            data={
-                CONF_PASSWORD: password,
-                CONF_USERNAME: user,
-                CONF_MYDEVOLO: mydevolo.url,
-            },
-        )
+        if self.source != SOURCE_REAUTH:
+            await self.async_set_unique_id(uuid)
+            self._abort_if_unique_id_configured()
+            return self.async_create_entry(
+                title="devolo Home Control",
+                data={
+                    CONF_PASSWORD: mydevolo.password,
+                    CONF_USERNAME: mydevolo.user,
+                },
+            )
 
-    @callback
-    def _show_form(self, errors=None):
-        """Show the form to the user."""
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema(self.data_schema),
-            errors=errors if errors else {},
+        if self.unique_id != uuid:
+            # The old user and the new user are not the same. This could mess-up everything as all unique IDs might change.
+            raise UuidChanged
+
+        reauth_entry = self._get_reauth_entry()
+        return self.async_update_reload_and_abort(
+            reauth_entry, data=user_input, unique_id=uuid
         )

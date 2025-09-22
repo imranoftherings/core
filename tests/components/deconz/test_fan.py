@@ -1,210 +1,124 @@
 """deCONZ fan platform tests."""
 
-from copy import deepcopy
+from collections.abc import Callable
 from unittest.mock import patch
 
 import pytest
+from syrupy.assertion import SnapshotAssertion
 
-from homeassistant.components.deconz.const import DOMAIN as DECONZ_DOMAIN
-from homeassistant.components.deconz.gateway import get_gateway_from_config_entry
 from homeassistant.components.fan import (
-    ATTR_SPEED,
+    ATTR_PERCENTAGE,
     DOMAIN as FAN_DOMAIN,
-    SERVICE_SET_SPEED,
+    SERVICE_SET_PERCENTAGE,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
-    SPEED_HIGH,
-    SPEED_LOW,
-    SPEED_MEDIUM,
-    SPEED_OFF,
 )
-from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
-from homeassistant.setup import async_setup_component
+from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from .test_gateway import DECONZ_WEB_REQUEST, setup_deconz_integration
+from .conftest import ConfigEntryFactoryType, WebsocketDataType
 
-FANS = {
-    "1": {
-        "etag": "432f3de28965052961a99e3c5494daf4",
-        "hascolor": False,
-        "manufacturername": "King Of Fans,  Inc.",
-        "modelid": "HDC52EastwindFan",
-        "name": "Ceiling fan",
-        "state": {
-            "alert": "none",
-            "bri": 254,
-            "on": False,
-            "reachable": True,
-            "speed": 4,
-        },
-        "swversion": "0000000F",
-        "type": "Fan",
-        "uniqueid": "00:22:a3:00:00:27:8b:81-01",
-    }
-}
+from tests.common import snapshot_platform
+from tests.test_util.aiohttp import AiohttpClientMocker
 
 
-async def test_platform_manually_configured(hass):
-    """Test that we do not discover anything or try to set up a gateway."""
-    assert (
-        await async_setup_component(
-            hass, FAN_DOMAIN, {"fan": {"platform": DECONZ_DOMAIN}}
-        )
-        is True
-    )
-    assert DECONZ_DOMAIN not in hass.data
-
-
-async def test_no_fans(hass):
-    """Test that no fan entities are created."""
-    await setup_deconz_integration(hass)
-    assert len(hass.states.async_all()) == 0
-
-
-async def test_fans(hass):
+@pytest.mark.parametrize(
+    "light_payload",
+    [
+        {
+            "etag": "432f3de28965052961a99e3c5494daf4",
+            "hascolor": False,
+            "manufacturername": "King Of Fans,  Inc.",
+            "modelid": "HDC52EastwindFan",
+            "name": "Ceiling fan",
+            "state": {
+                "alert": "none",
+                "bri": 254,
+                "on": False,
+                "reachable": True,
+                "speed": 4,
+            },
+            "swversion": "0000000F",
+            "type": "Fan",
+            "uniqueid": "00:22:a3:00:00:27:8b:81-01",
+        }
+    ],
+)
+async def test_fans(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+    light_ws_data: WebsocketDataType,
+) -> None:
     """Test that all supported fan entities are created."""
-    data = deepcopy(DECONZ_WEB_REQUEST)
-    data["lights"] = deepcopy(FANS)
-    config_entry = await setup_deconz_integration(hass, get_state_response=data)
-    gateway = get_gateway_from_config_entry(hass, config_entry)
+    with patch("homeassistant.components.deconz.PLATFORMS", [Platform.FAN]):
+        config_entry = await config_entry_factory()
 
-    assert len(hass.states.async_all()) == 2  # Light and fan
-    assert hass.states.get("fan.ceiling_fan")
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
     # Test states
 
-    assert hass.states.get("fan.ceiling_fan").state == STATE_ON
-    assert hass.states.get("fan.ceiling_fan").attributes["speed"] == SPEED_HIGH
+    for speed, percent in (1, 25), (2, 50), (3, 75), (4, 100):
+        await light_ws_data({"state": {"speed": speed}})
+        assert hass.states.get("fan.ceiling_fan").state == STATE_ON
+        assert hass.states.get("fan.ceiling_fan").attributes[ATTR_PERCENTAGE] == percent
 
-    state_changed_event = {
-        "t": "event",
-        "e": "changed",
-        "r": "lights",
-        "id": "1",
-        "state": {"speed": 0},
-    }
-    gateway.api.event_handler(state_changed_event)
-    await hass.async_block_till_done()
-
+    await light_ws_data({"state": {"speed": 0}})
     assert hass.states.get("fan.ceiling_fan").state == STATE_OFF
-    assert hass.states.get("fan.ceiling_fan").attributes["speed"] == SPEED_OFF
+    assert hass.states.get("fan.ceiling_fan").attributes[ATTR_PERCENTAGE] == 0
 
     # Test service calls
 
-    ceiling_fan_device = gateway.api.lights["1"]
+    aioclient_mock = mock_put_request("/lights/0/state")
 
-    # Service turn on fan
+    # Service turn on fan using saved default_on_speed
 
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_TURN_ON,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan"},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 4})
+    await hass.services.async_call(
+        FAN_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "fan.ceiling_fan"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"speed": 4}
 
     # Service turn off fan
 
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
+    await hass.services.async_call(
+        FAN_DOMAIN,
+        SERVICE_TURN_OFF,
+        {ATTR_ENTITY_ID: "fan.ceiling_fan"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[2][2] == {"speed": 0}
+
+    # Service turn on fan to 20%
+
+    await hass.services.async_call(
+        FAN_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_PERCENTAGE: 20},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[3][2] == {"speed": 1}
+
+    # Service set fan percentage
+
+    for percent, speed in (20, 1), (40, 2), (60, 3), (80, 4), (0, 0):
+        aioclient_mock.mock_calls.clear()
         await hass.services.async_call(
             FAN_DOMAIN,
-            SERVICE_TURN_OFF,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan"},
+            SERVICE_SET_PERCENTAGE,
+            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_PERCENTAGE: percent},
             blocking=True,
         )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 0})
+        assert aioclient_mock.mock_calls[0][2] == {"speed": speed}
 
-    # Service set fan speed to low
+    # Events with an unsupported speed does not get converted
 
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_SET_SPEED,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_SPEED: SPEED_LOW},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 1})
-
-    # Service set fan speed to medium
-
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_SET_SPEED,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_SPEED: SPEED_MEDIUM},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 2})
-
-    # Service set fan speed to high
-
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_SET_SPEED,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_SPEED: SPEED_HIGH},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 4})
-
-    # Service set fan speed to off
-
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback:
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_SET_SPEED,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_SPEED: SPEED_OFF},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"speed": 0})
-
-    # Service set fan speed to unsupported value
-
-    with patch.object(
-        ceiling_fan_device, "_request", return_value=True
-    ) as set_callback, pytest.raises(ValueError):
-        await hass.services.async_call(
-            FAN_DOMAIN,
-            SERVICE_SET_SPEED,
-            {ATTR_ENTITY_ID: "fan.ceiling_fan", ATTR_SPEED: "bad value"},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    # Events with an unsupported speed gets converted to default speed "medium"
-
-    state_changed_event = {
-        "t": "event",
-        "e": "changed",
-        "r": "lights",
-        "id": "1",
-        "state": {"speed": 3},
-    }
-    gateway.api.event_handler(state_changed_event)
-    await hass.async_block_till_done()
-
+    await light_ws_data({"state": {"speed": 5}})
     assert hass.states.get("fan.ceiling_fan").state == STATE_ON
-    assert hass.states.get("fan.ceiling_fan").attributes["speed"] == SPEED_MEDIUM
-
-    await hass.config_entries.async_unload(config_entry.entry_id)
-
-    assert len(hass.states.async_all()) == 0
+    assert not hass.states.get("fan.ceiling_fan").attributes[ATTR_PERCENTAGE]

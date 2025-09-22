@@ -1,161 +1,269 @@
 """Support for UK Met Office weather service."""
-from homeassistant.const import (
-    ATTR_ATTRIBUTION,
-    DEVICE_CLASS_HUMIDITY,
-    DEVICE_CLASS_TEMPERATURE,
-    LENGTH_KILOMETERS,
-    PERCENTAGE,
-    SPEED_MILES_PER_HOUR,
-    TEMP_CELSIUS,
-    UV_INDEX,
-)
-from homeassistant.core import callback
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.typing import ConfigType, HomeAssistantType
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from datapoint.Forecast import Forecast
+
+from homeassistant.components.sensor import (
+    DOMAIN as SENSOR_DOMAIN,
+    EntityCategory,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import (
+    DEGREE,
+    PERCENTAGE,
+    UV_INDEX,
+    UnitOfLength,
+    UnitOfPressure,
+    UnitOfSpeed,
+    UnitOfTemperature,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import StateType
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+)
+
+from . import get_device_info
 from .const import (
     ATTRIBUTION,
-    CONDITION_CLASSES,
+    CONDITION_MAP,
     DOMAIN,
-    METOFFICE_COORDINATOR,
-    METOFFICE_DATA,
+    METOFFICE_COORDINATES,
+    METOFFICE_HOURLY_COORDINATOR,
     METOFFICE_NAME,
-    VISIBILITY_CLASSES,
-    VISIBILITY_DISTANCE_CLASSES,
 )
+from .helpers import get_attribute
 
 ATTR_LAST_UPDATE = "last_update"
-ATTR_SENSOR_ID = "sensor_id"
-ATTR_SITE_ID = "site_id"
-ATTR_SITE_NAME = "site_name"
 
-# Sensor types are defined as:
-#   variable -> [0]title, [1]device_class, [2]units, [3]icon, [4]enabled_by_default
-SENSOR_TYPES = {
-    "name": ["Station Name", None, None, "mdi:label-outline", False],
-    "weather": [
-        "Weather",
-        None,
-        None,
-        "mdi:weather-sunny",  # but will adapt to current conditions
-        True,
-    ],
-    "temperature": ["Temperature", DEVICE_CLASS_TEMPERATURE, TEMP_CELSIUS, None, True],
-    "feels_like_temperature": [
-        "Feels Like Temperature",
-        DEVICE_CLASS_TEMPERATURE,
-        TEMP_CELSIUS,
-        None,
-        False,
-    ],
-    "wind_speed": [
-        "Wind Speed",
-        None,
-        SPEED_MILES_PER_HOUR,
-        "mdi:weather-windy",
-        True,
-    ],
-    "wind_direction": ["Wind Direction", None, None, "mdi:compass-outline", False],
-    "wind_gust": ["Wind Gust", None, SPEED_MILES_PER_HOUR, "mdi:weather-windy", False],
-    "visibility": ["Visibility", None, None, "mdi:eye", False],
-    "visibility_distance": [
-        "Visibility Distance",
-        None,
-        LENGTH_KILOMETERS,
-        "mdi:eye",
-        False,
-    ],
-    "uv": ["UV Index", None, UV_INDEX, "mdi:weather-sunny-alert", True],
-    "precipitation": [
-        "Probability of Precipitation",
-        None,
-        PERCENTAGE,
-        "mdi:weather-rainy",
-        True,
-    ],
-    "humidity": ["Humidity", DEVICE_CLASS_HUMIDITY, PERCENTAGE, None, False],
-}
+
+@dataclass(frozen=True, kw_only=True)
+class MetOfficeSensorEntityDescription(SensorEntityDescription):
+    """Entity description class for MetOffice sensors."""
+
+    native_attr_name: str
+
+
+SENSOR_TYPES: tuple[MetOfficeSensorEntityDescription, ...] = (
+    MetOfficeSensorEntityDescription(
+        key="name",
+        native_attr_name="name",
+        name="Station name",
+        icon="mdi:label-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="weather",
+        native_attr_name="significantWeatherCode",
+        name="Weather",
+        icon="mdi:weather-sunny",  # but will adapt to current conditions
+        entity_registry_enabled_default=True,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="temperature",
+        native_attr_name="screenTemperature",
+        name="Temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        entity_registry_enabled_default=True,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="feels_like_temperature",
+        native_attr_name="feelsLikeTemperature",
+        name="Feels like temperature",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        icon=None,
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="wind_speed",
+        native_attr_name="windSpeed10m",
+        name="Wind speed",
+        native_unit_of_measurement=UnitOfSpeed.METERS_PER_SECOND,
+        # Hint mph because that's the preferred unit for wind speeds in UK
+        # This can be removed if we add a mixed metric/imperial unit system for UK users
+        suggested_unit_of_measurement=UnitOfSpeed.MILES_PER_HOUR,
+        device_class=SensorDeviceClass.WIND_SPEED,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=True,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="wind_direction",
+        native_attr_name="windDirectionFrom10m",
+        name="Wind direction",
+        native_unit_of_measurement=DEGREE,
+        device_class=SensorDeviceClass.WIND_DIRECTION,
+        state_class=SensorStateClass.MEASUREMENT_ANGLE,
+        icon="mdi:compass-outline",
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="wind_gust",
+        native_attr_name="windGustSpeed10m",
+        name="Wind gust",
+        native_unit_of_measurement=UnitOfSpeed.METERS_PER_SECOND,
+        # Hint mph because that's the preferred unit for wind speeds in UK
+        # This can be removed if we add a mixed metric/imperial unit system for UK users
+        suggested_unit_of_measurement=UnitOfSpeed.MILES_PER_HOUR,
+        device_class=SensorDeviceClass.WIND_SPEED,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="visibility",
+        native_attr_name="visibility",
+        name="Visibility distance",
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfLength.METERS,
+        icon="mdi:eye",
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="uv",
+        native_attr_name="uvIndex",
+        name="UV index",
+        native_unit_of_measurement=UV_INDEX,
+        icon="mdi:weather-sunny-alert",
+        entity_registry_enabled_default=True,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="precipitation",
+        native_attr_name="probOfPrecipitation",
+        state_class=SensorStateClass.MEASUREMENT,
+        name="Probability of precipitation",
+        native_unit_of_measurement=PERCENTAGE,
+        icon="mdi:weather-rainy",
+        entity_registry_enabled_default=True,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="humidity",
+        native_attr_name="screenRelativeHumidity",
+        name="Humidity",
+        device_class=SensorDeviceClass.HUMIDITY,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        icon=None,
+        entity_registry_enabled_default=False,
+    ),
+    MetOfficeSensorEntityDescription(
+        key="pressure",
+        native_attr_name="mslp",
+        name="Pressure",
+        device_class=SensorDeviceClass.PRESSURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfPressure.PA,
+        suggested_unit_of_measurement=UnitOfPressure.HPA,
+        entity_registry_enabled_default=False,
+    ),
+)
 
 
 async def async_setup_entry(
-    hass: HomeAssistantType, entry: ConfigType, async_add_entities
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Met Office weather sensor platform."""
+    entity_registry = er.async_get(hass)
     hass_data = hass.data[DOMAIN][entry.entry_id]
+
+    # Remove daily entities from legacy config entries
+    for description in SENSOR_TYPES:
+        if entity_id := entity_registry.async_get_entity_id(
+            SENSOR_DOMAIN,
+            DOMAIN,
+            f"{description.key}_{hass_data[METOFFICE_COORDINATES]}_daily",
+        ):
+            entity_registry.async_remove(entity_id)
+
+    # Remove old visibility sensors
+    if entity_id := entity_registry.async_get_entity_id(
+        SENSOR_DOMAIN,
+        DOMAIN,
+        f"visibility_distance_{hass_data[METOFFICE_COORDINATES]}_daily",
+    ):
+        entity_registry.async_remove(entity_id)
+    if entity_id := entity_registry.async_get_entity_id(
+        SENSOR_DOMAIN,
+        DOMAIN,
+        f"visibility_distance_{hass_data[METOFFICE_COORDINATES]}",
+    ):
+        entity_registry.async_remove(entity_id)
 
     async_add_entities(
         [
-            MetOfficeCurrentSensor(entry.data, hass_data, sensor_type)
-            for sensor_type in SENSOR_TYPES
+            MetOfficeCurrentSensor(
+                hass_data[METOFFICE_HOURLY_COORDINATOR],
+                hass_data,
+                description,
+            )
+            for description in SENSOR_TYPES
         ],
         False,
     )
 
 
-class MetOfficeCurrentSensor(Entity):
+class MetOfficeCurrentSensor(
+    CoordinatorEntity[DataUpdateCoordinator[Forecast]], SensorEntity
+):
     """Implementation of a Met Office current weather condition sensor."""
 
-    def __init__(self, entry_data, hass_data, sensor_type):
+    _attr_attribution = ATTRIBUTION
+    _attr_has_entity_name = True
+
+    entity_description: MetOfficeSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator[Forecast],
+        hass_data: dict[str, Any],
+        description: MetOfficeSensorEntityDescription,
+    ) -> None:
         """Initialize the sensor."""
-        self._data = hass_data[METOFFICE_DATA]
-        self._coordinator = hass_data[METOFFICE_COORDINATOR]
+        super().__init__(coordinator)
 
-        self._type = sensor_type
-        self._name = f"{hass_data[METOFFICE_NAME]} {SENSOR_TYPES[self._type][0]}"
-        self._unique_id = f"{SENSOR_TYPES[self._type][0]}_{self._data.latitude}_{self._data.longitude}"
+        self.entity_description = description
 
-        self.metoffice_site_id = None
-        self.metoffice_site_name = None
-        self.metoffice_now = None
+        self._attr_device_info = get_device_info(
+            coordinates=hass_data[METOFFICE_COORDINATES], name=hass_data[METOFFICE_NAME]
+        )
+        self._attr_unique_id = f"{description.key}_{hass_data[METOFFICE_COORDINATES]}"
 
     @property
-    def name(self):
-        """Return the name of the sensor."""
-        return self._name
-
-    @property
-    def unique_id(self):
-        """Return the unique of the sensor."""
-        return self._unique_id
-
-    @property
-    def state(self):
+    def native_value(self) -> StateType:
         """Return the state of the sensor."""
-        value = None
+        native_attr = self.entity_description.native_attr_name
 
-        if self._type == "visibility_distance" and hasattr(
-            self.metoffice_now, "visibility"
-        ):
-            value = VISIBILITY_DISTANCE_CLASSES.get(self.metoffice_now.visibility.value)
+        if native_attr == "name":
+            return str(self.coordinator.data.name)
 
-        if self._type == "visibility" and hasattr(self.metoffice_now, "visibility"):
-            value = VISIBILITY_CLASSES.get(self.metoffice_now.visibility.value)
-
-        elif self._type == "weather" and hasattr(self.metoffice_now, self._type):
-            value = [
-                k
-                for k, v in CONDITION_CLASSES.items()
-                if self.metoffice_now.weather.value in v
-            ][0]
-
-        elif hasattr(self.metoffice_now, self._type):
-            value = getattr(self.metoffice_now, self._type)
-
-            if not isinstance(value, int):
-                value = value.value
+        value = get_attribute(self.coordinator.data.now(), native_attr)
+        if native_attr == "significantWeatherCode" and value is not None:
+            value = CONDITION_MAP.get(value)
 
         return value
 
     @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement."""
-        return SENSOR_TYPES[self._type][2]
-
-    @property
-    def icon(self):
+    def icon(self) -> str | None:
         """Return the icon for the entity card."""
-        value = SENSOR_TYPES[self._type][3]
-        if self._type == "weather":
+        value = self.entity_description.icon
+        if self.entity_description.native_attr_name == "significantWeatherCode":
             value = self.state
             if value is None:
                 value = "sunny"
@@ -166,53 +274,8 @@ class MetOfficeCurrentSensor(Entity):
         return value
 
     @property
-    def device_class(self):
-        """Return the device class of the sensor."""
-        return SENSOR_TYPES[self._type][1]
-
-    @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of the device."""
         return {
-            ATTR_ATTRIBUTION: ATTRIBUTION,
-            ATTR_LAST_UPDATE: self.metoffice_now.date if self.metoffice_now else None,
-            ATTR_SENSOR_ID: self._type,
-            ATTR_SITE_ID: self.metoffice_site_id if self.metoffice_site_id else None,
-            ATTR_SITE_NAME: self.metoffice_site_name
-            if self.metoffice_site_name
-            else None,
+            ATTR_LAST_UPDATE: self.coordinator.data.now()["time"],
         }
-
-    async def async_added_to_hass(self) -> None:
-        """Set up a listener and load data."""
-        self.async_on_remove(
-            self._coordinator.async_add_listener(self._update_callback)
-        )
-        self._update_callback()
-
-    async def async_update(self):
-        """Schedule a custom update via the common entity update service."""
-        await self._coordinator.async_request_refresh()
-
-    @callback
-    def _update_callback(self) -> None:
-        """Load data from integration."""
-        self.metoffice_site_id = self._data.site_id
-        self.metoffice_site_name = self._data.site_name
-        self.metoffice_now = self._data.now
-        self.async_write_ha_state()
-
-    @property
-    def should_poll(self) -> bool:
-        """Entities do not individually poll."""
-        return False
-
-    @property
-    def entity_registry_enabled_default(self) -> bool:
-        """Return if the entity should be enabled when first added to the entity registry."""
-        return SENSOR_TYPES[self._type][4]
-
-    @property
-    def available(self):
-        """Return if state is available."""
-        return self.metoffice_site_id is not None and self.metoffice_now is not None

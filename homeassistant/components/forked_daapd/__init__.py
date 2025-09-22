@@ -1,34 +1,36 @@
 """The forked_daapd component."""
-from homeassistant.components.media_player import DOMAIN as MP_DOMAIN
 
-from .const import DOMAIN, HASS_DATA_REMOVE_LISTENERS_KEY, HASS_DATA_UPDATER_KEY
+from pyforked_daapd import ForkedDaapdAPI
+
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .coordinator import ForkedDaapdConfigEntry, ForkedDaapdUpdater
+
+PLATFORMS = [Platform.MEDIA_PLAYER]
 
 
-async def async_setup(hass, config):
-    """Set up the forked-daapd component."""
-    return True
-
-
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ForkedDaapdConfigEntry) -> bool:
     """Set up forked-daapd from a config entry by forwarding to platform."""
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, MP_DOMAIN)
+    host: str = entry.data[CONF_HOST]
+    port: int = entry.data[CONF_PORT]
+    password: str = entry.data[CONF_PASSWORD]
+    forked_daapd_api = ForkedDaapdAPI(
+        async_get_clientsession(hass), host, port, password
     )
+    forked_daapd_updater = ForkedDaapdUpdater(hass, forked_daapd_api, entry.entry_id)
+    entry.runtime_data = forked_daapd_updater
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(
+    hass: HomeAssistant, entry: ForkedDaapdConfigEntry
+) -> bool:
     """Remove forked-daapd component."""
-    status = await hass.config_entries.async_forward_entry_unload(entry, MP_DOMAIN)
-    if status and hass.data.get(DOMAIN) and hass.data[DOMAIN].get(entry.entry_id):
-        hass.data[DOMAIN][entry.entry_id][
-            HASS_DATA_UPDATER_KEY
-        ].websocket_handler.cancel()
-        for remove_listener in hass.data[DOMAIN][entry.entry_id][
-            HASS_DATA_REMOVE_LISTENERS_KEY
-        ]:
-            remove_listener()
-        del hass.data[DOMAIN][entry.entry_id]
-        if not hass.data[DOMAIN]:
-            del hass.data[DOMAIN]
+    status = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if status:
+        if websocket_handler := entry.runtime_data.websocket_handler:
+            websocket_handler.cancel()
     return status

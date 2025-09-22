@@ -1,132 +1,112 @@
-"""Tests for 1-Wire devices connected on OWServer."""
-import copy
-from unittest.mock import patch
+"""Tests for 1-Wire switches."""
 
-from pyownet.protocol import Error as ProtocolError
+from collections.abc import Generator
+from unittest.mock import MagicMock, patch
+
+from freezegun.api import FrozenDateTimeFactory
 import pytest
+from syrupy.assertion import SnapshotAssertion
 
-from homeassistant.components.onewire.switch import DEVICE_SWITCHES
+from homeassistant.components.onewire.onewirehub import _DEVICE_SCAN_INTERVAL
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
-from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TOGGLE, STATE_OFF, STATE_ON
-from homeassistant.setup import async_setup_component
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    SERVICE_TOGGLE,
+    STATE_OFF,
+    STATE_ON,
+    Platform,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from . import setup_onewire_patched_owserver_integration
+from . import setup_owproxy_mock_devices
+from .const import MOCK_OWPROXY_DEVICES
 
-from tests.common import mock_registry
-
-MOCK_DEVICE_SENSORS = {
-    "12.111111111111": {
-        "inject_reads": [
-            b"DS2406",  # read device type
-        ],
-        SWITCH_DOMAIN: [
-            {
-                "entity_id": "switch.12_111111111111_pio_a",
-                "unique_id": "/12.111111111111/PIO.A",
-                "injected_value": b"    1",
-                "result": STATE_ON,
-                "unit": None,
-                "class": None,
-                "disabled": True,
-            },
-            {
-                "entity_id": "switch.12_111111111111_pio_b",
-                "unique_id": "/12.111111111111/PIO.B",
-                "injected_value": b"    0",
-                "result": STATE_OFF,
-                "unit": None,
-                "class": None,
-                "disabled": True,
-            },
-            {
-                "entity_id": "switch.12_111111111111_latch_a",
-                "unique_id": "/12.111111111111/latch.A",
-                "injected_value": b"    1",
-                "result": STATE_ON,
-                "unit": None,
-                "class": None,
-                "disabled": True,
-            },
-            {
-                "entity_id": "switch.12_111111111111_latch_b",
-                "unique_id": "/12.111111111111/latch.B",
-                "injected_value": b"    0",
-                "result": STATE_OFF,
-                "unit": None,
-                "class": None,
-                "disabled": True,
-            },
-        ],
-    }
-}
+from tests.common import MockConfigEntry, async_fire_time_changed, snapshot_platform
 
 
-@pytest.mark.parametrize("device_id", ["12.111111111111"])
-@patch("homeassistant.components.onewire.onewirehub.protocol.proxy")
-async def test_owserver_switch(owproxy, hass, device_id):
-    """Test for 1-Wire switch.
+@pytest.fixture(autouse=True)
+def override_platforms() -> Generator[None]:
+    """Override PLATFORMS."""
+    with patch("homeassistant.components.onewire._PLATFORMS", [Platform.SWITCH]):
+        yield
 
-    This test forces all entities to be enabled.
-    """
-    await async_setup_component(hass, "persistent_notification", {})
-    entity_registry = mock_registry(hass)
 
-    mock_device_sensor = MOCK_DEVICE_SENSORS[device_id]
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_switches(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    owproxy: MagicMock,
+    entity_registry: er.EntityRegistry,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test for 1-Wire switch entities."""
+    setup_owproxy_mock_devices(owproxy, MOCK_OWPROXY_DEVICES.keys())
+    await hass.config_entries.async_setup(config_entry.entry_id)
 
-    device_family = device_id[0:2]
-    dir_return_value = [f"/{device_id}/"]
-    read_side_effect = [device_family.encode()]
-    if "inject_reads" in mock_device_sensor:
-        read_side_effect += mock_device_sensor["inject_reads"]
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
 
-    expected_sensors = mock_device_sensor[SWITCH_DOMAIN]
-    for expected_sensor in expected_sensors:
-        read_side_effect.append(expected_sensor["injected_value"])
 
-    # Ensure enough read side effect
-    read_side_effect.extend([ProtocolError("Missing injected value")] * 10)
-    owproxy.return_value.dir.return_value = dir_return_value
-    owproxy.return_value.read.side_effect = read_side_effect
+@pytest.mark.parametrize("device_id", ["05.111111111111"])
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_switches_delayed(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    owproxy: MagicMock,
+    device_id: str,
+    entity_registry: er.EntityRegistry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test for delayed 1-Wire switch entities."""
+    setup_owproxy_mock_devices(owproxy, [])
+    await hass.config_entries.async_setup(config_entry.entry_id)
 
-    # Force enable switches
-    patch_device_switches = copy.deepcopy(DEVICE_SWITCHES)
-    for item in patch_device_switches[device_family]:
-        item["default_disabled"] = False
+    assert not er.async_entries_for_config_entry(entity_registry, config_entry.entry_id)
 
-    with patch(
-        "homeassistant.components.onewire.SUPPORTED_PLATFORMS", [SWITCH_DOMAIN]
-    ), patch.dict(
-        "homeassistant.components.onewire.switch.DEVICE_SWITCHES", patch_device_switches
-    ):
-        await setup_onewire_patched_owserver_integration(hass)
-        await hass.async_block_till_done()
+    setup_owproxy_mock_devices(owproxy, [device_id])
+    freezer.tick(_DEVICE_SCAN_INTERVAL)
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
 
-    assert len(entity_registry.entities) == len(expected_sensors)
+    assert (
+        len(er.async_entries_for_config_entry(entity_registry, config_entry.entry_id))
+        == 1
+    )
 
-    for expected_sensor in expected_sensors:
-        entity_id = expected_sensor["entity_id"]
-        registry_entry = entity_registry.entities.get(entity_id)
-        assert registry_entry is not None
-        state = hass.states.get(entity_id)
-        assert state.state == expected_sensor["result"]
 
-        if state.state == STATE_ON:
-            owproxy.return_value.read.side_effect = [b"         0"]
-            expected_sensor["result"] = STATE_OFF
-        elif state.state == STATE_OFF:
-            owproxy.return_value.read.side_effect = [b"         1"]
-            expected_sensor["result"] = STATE_ON
+@pytest.mark.parametrize("device_id", ["05.111111111111"])
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_switch_toggle(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+    owproxy: MagicMock,
+    device_id: str,
+) -> None:
+    """Test for 1-Wire switch TOGGLE service."""
+    setup_owproxy_mock_devices(owproxy, [device_id])
+    await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
 
-        await hass.services.async_call(
-            SWITCH_DOMAIN,
-            SERVICE_TOGGLE,
-            {ATTR_ENTITY_ID: entity_id},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
+    entity_id = "switch.05_111111111111_programmed_input_output"
 
-        state = hass.states.get(entity_id)
-        assert state.state == expected_sensor["result"]
-        assert state.attributes["device_file"] == expected_sensor.get(
-            "device_file", registry_entry.unique_id
-        )
+    # Test TOGGLE service to off
+    owproxy.return_value.read.side_effect = [b"         0"]
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TOGGLE,
+        {ATTR_ENTITY_ID: entity_id},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_OFF
+
+    # Test TOGGLE service to on
+    owproxy.return_value.read.side_effect = [b"         1"]
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TOGGLE,
+        {ATTR_ENTITY_ID: entity_id},
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_ON

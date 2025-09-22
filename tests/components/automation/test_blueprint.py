@@ -1,34 +1,47 @@
 """Test built-in blueprints."""
+
 import asyncio
+from collections.abc import Iterator
 import contextlib
 from datetime import timedelta
+from os import PathLike
 import pathlib
+from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from homeassistant.components import automation
 from homeassistant.components.blueprint import models
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.setup import async_setup_component
-from homeassistant.util import dt as dt_util, yaml
+from homeassistant.util import dt as dt_util, yaml as yaml_util
 
-from tests.common import async_fire_time_changed, async_mock_service
+from tests.common import MockConfigEntry, async_fire_time_changed, async_mock_service
 
 BUILTIN_BLUEPRINT_FOLDER = pathlib.Path(automation.__file__).parent / "blueprints"
 
 
 @contextlib.contextmanager
-def patch_blueprint(blueprint_path: str, data_path):
+def patch_blueprint(
+    blueprint_path: str, data_path: str | PathLike[str]
+) -> Iterator[None]:
     """Patch blueprint loading from a different source."""
     orig_load = models.DomainBlueprints._load_blueprint
 
     @callback
     def mock_load_blueprint(self, path):
         if path != blueprint_path:
-            assert False, f"Unexpected blueprint {path}"
+            pytest.fail(f"Unexpected blueprint {path}")
             return orig_load(self, path)
 
         return models.Blueprint(
-            yaml.load_yaml(data_path), expected_domain=self.domain, path=path
+            yaml_util.load_yaml(data_path),
+            expected_domain=self.domain,
+            path=path,
+            schema=automation.config.AUTOMATION_BLUEPRINT_SCHEMA,
         )
 
     with patch(
@@ -38,15 +51,25 @@ def patch_blueprint(blueprint_path: str, data_path):
         yield
 
 
-async def test_notify_leaving_zone(hass):
+async def test_notify_leaving_zone(
+    hass: HomeAssistant, device_registry: dr.DeviceRegistry
+) -> None:
     """Test notifying leaving a zone blueprint."""
+    config_entry = MockConfigEntry(domain="fake_integration", data={})
+    config_entry.mock_state(hass, ConfigEntryState.LOADED)
+    config_entry.add_to_hass(hass)
 
-    def set_person_state(state, extra={}):
+    device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, "00:00:00:00:00:01")},
+    )
+
+    def set_person_state(state: str, extra: dict[str, Any]) -> None:
         hass.states.async_set(
             "person.test_person", state, {"friendly_name": "Paulus", **extra}
         )
 
-    set_person_state("School")
+    set_person_state("School", {})
 
     assert await async_setup_component(
         hass, "zone", {"zone": {"name": "School", "latitude": 1, "longitude": 2}}
@@ -66,7 +89,7 @@ async def test_notify_leaving_zone(hass):
                         "input": {
                             "person_entity": "person.test_person",
                             "zone_entity": "zone.school",
-                            "notify_device": "abcdefgh",
+                            "notify_device": device.id,
                         },
                     }
                 }
@@ -77,28 +100,29 @@ async def test_notify_leaving_zone(hass):
         "homeassistant.components.mobile_app.device_action.async_call_action_from_config"
     ) as mock_call_action:
         # Leaving zone to no zone
-        set_person_state("not_home")
+        set_person_state("not_home", {})
         await hass.async_block_till_done()
 
         assert len(mock_call_action.mock_calls) == 1
         _hass, config, variables, _context = mock_call_action.mock_calls[0][1]
         message_tpl = config.pop("message")
         assert config == {
+            "alias": "Notify that a person has left the zone",
             "domain": "mobile_app",
             "type": "notify",
-            "device_id": "abcdefgh",
+            "device_id": device.id,
         }
         message_tpl.hass = hass
         assert message_tpl.async_render(variables) == "Paulus has left School"
 
         # Should not increase when we go to another zone
-        set_person_state("bla")
+        set_person_state("bla", {})
         await hass.async_block_till_done()
 
         assert len(mock_call_action.mock_calls) == 1
 
         # Should not increase when we go into the zone
-        set_person_state("School")
+        set_person_state("School", {})
         await hass.async_block_till_done()
 
         assert len(mock_call_action.mock_calls) == 1
@@ -110,7 +134,7 @@ async def test_notify_leaving_zone(hass):
         assert len(mock_call_action.mock_calls) == 1
 
         # Should increase when leaving zone for another zone
-        set_person_state("Just Outside School")
+        set_person_state("Just Outside School", {})
         await hass.async_block_till_done()
 
         assert len(mock_call_action.mock_calls) == 2
@@ -125,7 +149,7 @@ async def test_notify_leaving_zone(hass):
         assert len(mock_call_action.mock_calls) == 3
 
 
-async def test_motion_light(hass):
+async def test_motion_light(hass: HomeAssistant) -> None:
     """Test motion light blueprint."""
     hass.states.async_set("binary_sensor.kitchen", "off")
 
@@ -155,8 +179,8 @@ async def test_motion_light(hass):
     # Turn on motion
     hass.states.async_set("binary_sensor.kitchen", "on")
     # Can't block till done because delay is active
-    # So wait 5 event loop iterations to process script
-    for _ in range(5):
+    # So wait 10 event loop iterations to process script
+    for _ in range(10):
         await asyncio.sleep(0)
 
     assert len(turn_on_calls) == 1
@@ -164,7 +188,7 @@ async def test_motion_light(hass):
     # Test light doesn't turn off if motion stays
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=200))
 
-    for _ in range(5):
+    for _ in range(10):
         await asyncio.sleep(0)
 
     assert len(turn_off_calls) == 0
@@ -172,7 +196,7 @@ async def test_motion_light(hass):
     # Test light turns off off 120s after last motion
     hass.states.async_set("binary_sensor.kitchen", "off")
 
-    for _ in range(5):
+    for _ in range(10):
         await asyncio.sleep(0)
 
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=120))
@@ -183,7 +207,7 @@ async def test_motion_light(hass):
     # Test restarting the script
     hass.states.async_set("binary_sensor.kitchen", "on")
 
-    for _ in range(5):
+    for _ in range(10):
         await asyncio.sleep(0)
 
     assert len(turn_on_calls) == 2
@@ -191,7 +215,7 @@ async def test_motion_light(hass):
 
     hass.states.async_set("binary_sensor.kitchen", "off")
 
-    for _ in range(5):
+    for _ in range(10):
         await asyncio.sleep(0)
 
     hass.states.async_set("binary_sensor.kitchen", "on")

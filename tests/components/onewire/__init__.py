@@ -1,91 +1,98 @@
 """Tests for 1-Wire integration."""
 
-from unittest.mock import patch
+from __future__ import annotations
 
-from homeassistant.components.onewire.const import (
-    CONF_MOUNT_DIR,
-    CONF_NAMES,
-    CONF_TYPE_OWSERVER,
-    CONF_TYPE_SYSBUS,
-    DEFAULT_SYSBUS_MOUNT_DIR,
-    DOMAIN,
-)
-from homeassistant.config_entries import CONN_CLASS_LOCAL_POLL
-from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE
+from typing import Any
+from unittest.mock import MagicMock
 
-from tests.common import MockConfigEntry
+from pyownet.protocol import ProtocolError
+
+from .const import ATTR_INJECT_READS, MOCK_OWPROXY_DEVICES
 
 
-async def setup_onewire_sysbus_integration(hass):
-    """Create the 1-Wire integration."""
-    config_entry = MockConfigEntry(
-        domain=DOMAIN,
-        source="user",
-        data={
-            CONF_TYPE: CONF_TYPE_SYSBUS,
-            CONF_MOUNT_DIR: DEFAULT_SYSBUS_MOUNT_DIR,
-        },
-        unique_id=f"{CONF_TYPE_SYSBUS}:{DEFAULT_SYSBUS_MOUNT_DIR}",
-        connection_class=CONN_CLASS_LOCAL_POLL,
-        options={},
-        entry_id="1",
+def setup_owproxy_mock_devices(owproxy: MagicMock, device_ids: list[str]) -> None:
+    """Set up mock for owproxy."""
+    dir_side_effect: dict[str, list] = {}
+    read_side_effect: dict[str, list] = {
+        "/system/configuration/version": [b"3.2"],
+    }
+
+    # Setup directory listing
+    dir_side_effect["/"] = [[f"/{device_id}/" for device_id in device_ids]]
+
+    for device_id in device_ids:
+        _setup_owproxy_mock_device(dir_side_effect, read_side_effect, device_id)
+
+    def _dir(path: str) -> Any:
+        if (side_effect := dir_side_effect.get(path)) is None:
+            raise NotImplementedError(f"Unexpected _dir call: {path}")
+        result = side_effect.pop(0)
+        if isinstance(result, Exception) or (
+            isinstance(result, type) and issubclass(result, Exception)
+        ):
+            raise result
+        return result
+
+    def _read(path: str) -> Any:
+        if (side_effect := read_side_effect.get(path)) is None:
+            raise NotImplementedError(f"Unexpected _read call: {path}")
+        if len(side_effect) == 0:
+            raise ProtocolError(f"Missing injected value for: {path}")
+        result = side_effect.pop(0)
+        if isinstance(result, Exception) or (
+            isinstance(result, type) and issubclass(result, Exception)
+        ):
+            raise result
+        return result
+
+    owproxy.return_value.dir.side_effect = _dir
+    owproxy.return_value.read.side_effect = _read
+
+
+def _setup_owproxy_mock_device(
+    dir_side_effect: dict[str, list], read_side_effect: dict[str, list], device_id: str
+) -> None:
+    """Set up mock for owproxy."""
+    mock_device = MOCK_OWPROXY_DEVICES[device_id]
+
+    if "branches" in mock_device:
+        # Setup branch directory listing
+        for branch, branch_details in mock_device["branches"].items():
+            sub_dir_side_effect = dir_side_effect.setdefault(
+                f"/{device_id}/{branch}", []
+            )
+            sub_dir_side_effect.append(
+                [  # dir on branch
+                    f"/{device_id}/{branch}/{sub_device_id}/"
+                    for sub_device_id in branch_details
+                ]
+            )
+
+    _setup_owproxy_mock_device_reads(read_side_effect, mock_device, "/", device_id)
+
+    if "branches" in mock_device:
+        for branch, branch_details in mock_device["branches"].items():
+            for sub_device_id, sub_device in branch_details.items():
+                _setup_owproxy_mock_device_reads(
+                    read_side_effect,
+                    sub_device,
+                    f"/{device_id}/{branch}/",
+                    sub_device_id,
+                )
+
+
+def _setup_owproxy_mock_device_reads(
+    read_side_effect: dict[str, list], mock_device: Any, root_path: str, device_id: str
+) -> None:
+    """Set up mock for owproxy."""
+    # Setup device reads
+    family_read_side_effect = read_side_effect.setdefault(
+        f"{root_path}{device_id}/family", []
     )
-    config_entry.add_to_hass(hass)
-
-    with patch(
-        "homeassistant.components.onewire.onewirehub.os.path.isdir", return_value=True
-    ):
-        await hass.config_entries.async_setup(config_entry.entry_id)
-        await hass.async_block_till_done()
-
-    return config_entry
-
-
-async def setup_onewire_owserver_integration(hass):
-    """Create the 1-Wire integration."""
-    config_entry = MockConfigEntry(
-        domain=DOMAIN,
-        source="user",
-        data={
-            CONF_TYPE: CONF_TYPE_OWSERVER,
-            CONF_HOST: "1.2.3.4",
-            CONF_PORT: 1234,
-        },
-        connection_class=CONN_CLASS_LOCAL_POLL,
-        options={},
-        entry_id="2",
-    )
-    config_entry.add_to_hass(hass)
-
-    with patch(
-        "homeassistant.components.onewire.onewirehub.protocol.proxy",
-    ):
-        await hass.config_entries.async_setup(config_entry.entry_id)
-        await hass.async_block_till_done()
-
-        return config_entry
-
-
-async def setup_onewire_patched_owserver_integration(hass):
-    """Create the 1-Wire integration."""
-    config_entry = MockConfigEntry(
-        domain=DOMAIN,
-        source="user",
-        data={
-            CONF_TYPE: CONF_TYPE_OWSERVER,
-            CONF_HOST: "1.2.3.4",
-            CONF_PORT: 1234,
-            CONF_NAMES: {
-                "10.111111111111": "My DS18B20",
-            },
-        },
-        connection_class=CONN_CLASS_LOCAL_POLL,
-        options={},
-        entry_id="2",
-    )
-    config_entry.add_to_hass(hass)
-
-    await hass.config_entries.async_setup(config_entry.entry_id)
-    await hass.async_block_till_done()
-
-    return config_entry
+    family_read_side_effect += [device_id[0:2].encode()]
+    if ATTR_INJECT_READS in mock_device:
+        for k, v in mock_device[ATTR_INJECT_READS].items():
+            device_read_side_effect = read_side_effect.setdefault(
+                f"{root_path}{device_id}{k}", []
+            )
+            device_read_side_effect += v

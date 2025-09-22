@@ -1,4 +1,5 @@
 """Tests for the WiLight integration."""
+
 from unittest.mock import patch
 
 import pytest
@@ -16,9 +17,10 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
 )
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from tests.components.wilight import (
+from . import (
     HOST,
     UPNP_MAC_ADDRESS,
     UPNP_MODEL_NAME_COLOR,
@@ -128,7 +130,8 @@ def mock_dummy_device_from_host_color():
 
 
 async def test_loading_light(
-    hass: HomeAssistantType,
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
     dummy_device_from_host_light_fan,
     dummy_get_components_from_model_light,
 ) -> None:
@@ -139,8 +142,6 @@ async def test_loading_light(
     entry = await setup_integration(hass)
     assert entry
     assert entry.unique_id == WILIGHT_ID
-
-    entity_registry = await hass.helpers.entity_registry.async_get_registry()
 
     # First segment of the strip
     state = hass.states.get("light.wl000000000099_1")
@@ -153,7 +154,7 @@ async def test_loading_light(
 
 
 async def test_on_off_light_state(
-    hass: HomeAssistantType, dummy_device_from_host_pb
+    hass: HomeAssistant, dummy_device_from_host_pb
 ) -> None:
     """Test the change of state of the light switches."""
     await setup_integration(hass)
@@ -186,7 +187,7 @@ async def test_on_off_light_state(
 
 
 async def test_dimmer_light_state(
-    hass: HomeAssistantType, dummy_device_from_host_dimmer
+    hass: HomeAssistant, dummy_device_from_host_dimmer
 ) -> None:
     """Test the change of state of the light switches."""
     await setup_integration(hass)
@@ -256,7 +257,7 @@ async def test_dimmer_light_state(
 
 
 async def test_color_light_state(
-    hass: HomeAssistantType, dummy_device_from_host_color
+    hass: HomeAssistant, dummy_device_from_host_color
 ) -> None:
     """Test the change of state of the light switches."""
     await setup_integration(hass)

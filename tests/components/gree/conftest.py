@@ -1,36 +1,35 @@
 """Pytest module configuration."""
+
+from collections.abc import Generator
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from .common import build_device_info_mock, build_device_mock
+from .common import FakeDiscovery, build_device_mock
 
 
-@pytest.fixture(name="discovery")
-def discovery_fixture():
-    """Patch the discovery service."""
+@pytest.fixture
+def mock_setup_entry() -> Generator[AsyncMock]:
+    """Override async_setup_entry."""
     with patch(
-        "homeassistant.components.gree.bridge.Discovery.search_devices",
-        new_callable=AsyncMock,
-        return_value=[build_device_info_mock()],
-    ) as mock:
+        "homeassistant.components.gree.async_setup_entry", return_value=True
+    ) as mock_setup_entry:
+        yield mock_setup_entry
+
+
+@pytest.fixture(autouse=True, name="discovery")
+def discovery_fixture():
+    """Patch the discovery object."""
+    with patch("homeassistant.components.gree.coordinator.Discovery") as mock:
+        mock.return_value = FakeDiscovery()
         yield mock
 
 
-@pytest.fixture(name="device")
+@pytest.fixture(autouse=True, name="device")
 def device_fixture():
-    """Path the device search and bind."""
+    """Patch the device search and bind."""
     with patch(
-        "homeassistant.components.gree.bridge.Device",
+        "homeassistant.components.gree.coordinator.Device",
         return_value=build_device_mock(),
     ) as mock:
         yield mock
-
-
-@pytest.fixture(name="setup")
-def setup_fixture():
-    """Patch the climate setup."""
-    with patch(
-        "homeassistant.components.gree.climate.async_setup_entry", return_value=True
-    ) as setup:
-        yield setup

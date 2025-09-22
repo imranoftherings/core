@@ -1,104 +1,81 @@
 """The Brother component."""
-import asyncio
-from datetime import timedelta
+
+from __future__ import annotations
+
 import logging
 
-from brother import Brother, SnmpError, UnsupportedModel
+from brother import Brother, SnmpError
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_TYPE, EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import Config, HomeAssistant
+from homeassistant.components.snmp import async_get_snmp_engine
+from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TYPE, Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN
-
-PLATFORMS = ["sensor"]
-
-SCAN_INTERVAL = timedelta(seconds=30)
+from .const import (
+    CONF_COMMUNITY,
+    DEFAULT_COMMUNITY,
+    DEFAULT_PORT,
+    DOMAIN,
+    SECTION_ADVANCED_SETTINGS,
+)
+from .coordinator import BrotherConfigEntry, BrotherDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-
-async def async_setup(hass: HomeAssistant, config: Config):
-    """Set up the Brother component."""
-    return True
+PLATFORMS = [Platform.SENSOR]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: BrotherConfigEntry) -> bool:
     """Set up Brother from a config entry."""
     host = entry.data[CONF_HOST]
-    kind = entry.data[CONF_TYPE]
+    port = entry.data[SECTION_ADVANCED_SETTINGS][CONF_PORT]
+    community = entry.data[SECTION_ADVANCED_SETTINGS][CONF_COMMUNITY]
+    printer_type = entry.data[CONF_TYPE]
 
-    coordinator = BrotherDataUpdateCoordinator(hass, host=host, kind=kind)
-    await coordinator.async_refresh()
-
-    if not coordinator.last_update_success:
-        coordinator.shutdown()
-        raise ConfigEntryNotReady
-
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
-
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
+    snmp_engine = await async_get_snmp_engine(hass)
+    try:
+        brother = await Brother.create(
+            host, port, community, printer_type=printer_type, snmp_engine=snmp_engine
         )
+    except (ConnectionError, SnmpError, TimeoutError) as error:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={
+                "device": entry.title,
+                "error": repr(error),
+            },
+        ) from error
+
+    coordinator = BrotherDataUpdateCoordinator(hass, entry, brother)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: BrotherConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: BrotherConfigEntry) -> bool:
+    """Migrate an old entry."""
+    if entry.version == 1 and entry.minor_version < 2:
+        new_data = entry.data.copy()
+        new_data[SECTION_ADVANCED_SETTINGS] = {
+            CONF_PORT: DEFAULT_PORT,
+            CONF_COMMUNITY: DEFAULT_COMMUNITY,
+        }
+        hass.config_entries.async_update_entry(entry, data=new_data, minor_version=2)
+
+    _LOGGER.info(
+        "Migration to configuration version %s.%s successful",
+        entry.version,
+        entry.minor_version,
     )
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id).shutdown()
 
-    return unload_ok
-
-
-class BrotherDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching Brother data from the printer."""
-
-    def __init__(self, hass, host, kind):
-        """Initialize."""
-        self.brother = Brother(host, kind=kind)
-        self._unsub_stop = hass.bus.async_listen(
-            EVENT_HOMEASSISTANT_STOP, self._handle_ha_stop
-        )
-
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=SCAN_INTERVAL,
-        )
-
-    async def _async_update_data(self):
-        """Update data via library."""
-        # Race condition on shutdown. Stop all the fetches.
-        if self._unsub_stop is None:
-            return None
-
-        try:
-            await self.brother.async_update()
-        except (ConnectionError, SnmpError, UnsupportedModel) as error:
-            raise UpdateFailed(error) from error
-        return self.brother.data
-
-    def shutdown(self):
-        """Shutdown the Brother coordinator."""
-        self._unsub_stop()
-        self._unsub_stop = None
-        self.brother.shutdown()
-
-    def _handle_ha_stop(self, _):
-        """Handle Home Assistant stopping."""
-        self.shutdown()
+    return True

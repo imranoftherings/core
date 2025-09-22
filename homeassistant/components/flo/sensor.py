@@ -1,158 +1,185 @@
 """Support for Flo Water Monitor sensors."""
 
-from typing import List, Optional
+from __future__ import annotations
 
-from homeassistant.const import (
-    DEVICE_CLASS_PRESSURE,
-    DEVICE_CLASS_TEMPERATURE,
-    PRESSURE_PSI,
-    TEMP_CELSIUS,
-    VOLUME_GALLONS,
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
 )
-from homeassistant.util.temperature import fahrenheit_to_celsius
+from homeassistant.const import (
+    PERCENTAGE,
+    UnitOfPressure,
+    UnitOfTemperature,
+    UnitOfVolume,
+    UnitOfVolumeFlowRate,
+)
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import DOMAIN as FLO_DOMAIN
-from .device import FloDeviceDataUpdateCoordinator
+from .coordinator import FloConfigEntry
 from .entity import FloEntity
 
-WATER_ICON = "mdi:water"
-GAUGE_ICON = "mdi:gauge"
-NAME_DAILY_USAGE = "Today's Water Usage"
-NAME_CURRENT_SYSTEM_MODE = "Current System Mode"
-NAME_FLOW_RATE = "Water Flow Rate"
-NAME_TEMPERATURE = "Water Temperature"
-NAME_WATER_PRESSURE = "Water Pressure"
 
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: FloConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Flo sensors from config entry."""
-    devices: List[FloDeviceDataUpdateCoordinator] = hass.data[FLO_DOMAIN][
-        config_entry.entry_id
-    ]["devices"]
+    devices = config_entry.runtime_data.devices
     entities = []
-    entities.extend([FloDailyUsageSensor(device) for device in devices])
-    entities.extend([FloSystemModeSensor(device) for device in devices])
-    entities.extend([FloCurrentFlowRateSensor(device) for device in devices])
-    entities.extend([FloTemperatureSensor(device) for device in devices])
-    entities.extend([FloPressureSensor(device) for device in devices])
+    for device in devices:
+        if device.device_type == "puck_oem":
+            entities.extend(
+                [
+                    FloTemperatureSensor(device, False),
+                    FloHumiditySensor(device),
+                    FloBatterySensor(device),
+                ]
+            )
+        else:
+            entities.extend(
+                [
+                    FloDailyUsageSensor(device),
+                    FloSystemModeSensor(device),
+                    FloCurrentFlowRateSensor(device),
+                    FloTemperatureSensor(device, True),
+                    FloPressureSensor(device),
+                ]
+            )
     async_add_entities(entities)
 
 
-class FloDailyUsageSensor(FloEntity):
+class FloDailyUsageSensor(FloEntity, SensorEntity):
     """Monitors the daily water usage."""
+
+    _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
+    _attr_state_class: SensorStateClass = SensorStateClass.TOTAL_INCREASING
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_translation_key = "daily_consumption"
 
     def __init__(self, device):
         """Initialize the daily water usage sensor."""
-        super().__init__("daily_consumption", NAME_DAILY_USAGE, device)
-        self._state: float = None
+        super().__init__("daily_consumption", device)
 
     @property
-    def icon(self) -> str:
-        """Return the daily usage icon."""
-        return WATER_ICON
-
-    @property
-    def state(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         """Return the current daily usage."""
         if self._device.consumption_today is None:
             return None
         return round(self._device.consumption_today, 1)
 
-    @property
-    def unit_of_measurement(self) -> str:
-        """Return gallons as the unit measurement for water."""
-        return VOLUME_GALLONS
 
-
-class FloSystemModeSensor(FloEntity):
+class FloSystemModeSensor(FloEntity, SensorEntity):
     """Monitors the current Flo system mode."""
+
+    _attr_translation_key = "current_system_mode"
 
     def __init__(self, device):
         """Initialize the system mode sensor."""
-        super().__init__("current_system_mode", NAME_CURRENT_SYSTEM_MODE, device)
-        self._state: str = None
+        super().__init__("current_system_mode", device)
 
     @property
-    def state(self) -> Optional[str]:
+    def native_value(self) -> str | None:
         """Return the current system mode."""
         if not self._device.current_system_mode:
             return None
         return self._device.current_system_mode
 
 
-class FloCurrentFlowRateSensor(FloEntity):
+class FloCurrentFlowRateSensor(FloEntity, SensorEntity):
     """Monitors the current water flow rate."""
+
+    _attr_native_unit_of_measurement = UnitOfVolumeFlowRate.GALLONS_PER_MINUTE
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+    _attr_device_class = SensorDeviceClass.VOLUME_FLOW_RATE
+    _attr_translation_key = "current_flow_rate"
 
     def __init__(self, device):
         """Initialize the flow rate sensor."""
-        super().__init__("current_flow_rate", NAME_FLOW_RATE, device)
-        self._state: float = None
+        super().__init__("current_flow_rate", device)
 
     @property
-    def icon(self) -> str:
-        """Return the daily usage icon."""
-        return GAUGE_ICON
-
-    @property
-    def state(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         """Return the current flow rate."""
         if self._device.current_flow_rate is None:
             return None
         return round(self._device.current_flow_rate, 1)
 
-    @property
-    def unit_of_measurement(self) -> str:
-        """Return the unit measurement."""
-        return "gpm"
 
-
-class FloTemperatureSensor(FloEntity):
+class FloTemperatureSensor(FloEntity, SensorEntity):
     """Monitors the temperature."""
 
-    def __init__(self, device):
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+
+    def __init__(self, device, is_water):
         """Initialize the temperature sensor."""
-        super().__init__("temperature", NAME_TEMPERATURE, device)
-        self._state: float = None
+        super().__init__("temperature", device)
+        if is_water:
+            self._attr_translation_key = "water_temperature"
 
     @property
-    def state(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         """Return the current temperature."""
         if self._device.temperature is None:
             return None
-        return round(fahrenheit_to_celsius(self._device.temperature), 1)
+        return round(self._device.temperature, 1)
+
+
+class FloHumiditySensor(FloEntity, SensorEntity):
+    """Monitors the humidity."""
+
+    _attr_device_class = SensorDeviceClass.HUMIDITY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+
+    def __init__(self, device):
+        """Initialize the humidity sensor."""
+        super().__init__("humidity", device)
 
     @property
-    def unit_of_measurement(self) -> str:
-        """Return gallons as the unit measurement for water."""
-        return TEMP_CELSIUS
-
-    @property
-    def device_class(self) -> Optional[str]:
-        """Return the device class for this sensor."""
-        return DEVICE_CLASS_TEMPERATURE
+    def native_value(self) -> float | None:
+        """Return the current humidity."""
+        if self._device.humidity is None:
+            return None
+        return round(self._device.humidity, 1)
 
 
-class FloPressureSensor(FloEntity):
+class FloPressureSensor(FloEntity, SensorEntity):
     """Monitors the water pressure."""
+
+    _attr_device_class = SensorDeviceClass.PRESSURE
+    _attr_native_unit_of_measurement = UnitOfPressure.PSI
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+    _attr_translation_key = "water_pressure"
 
     def __init__(self, device):
         """Initialize the pressure sensor."""
-        super().__init__("water_pressure", NAME_WATER_PRESSURE, device)
-        self._state: float = None
+        super().__init__("water_pressure", device)
 
     @property
-    def state(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         """Return the current water pressure."""
         if self._device.current_psi is None:
             return None
         return round(self._device.current_psi, 1)
 
-    @property
-    def unit_of_measurement(self) -> str:
-        """Return gallons as the unit measurement for water."""
-        return PRESSURE_PSI
+
+class FloBatterySensor(FloEntity, SensorEntity):
+    """Monitors the battery level for battery-powered leak detectors."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+
+    def __init__(self, device):
+        """Initialize the battery sensor."""
+        super().__init__("battery", device)
 
     @property
-    def device_class(self) -> Optional[str]:
-        """Return the device class for this sensor."""
-        return DEVICE_CLASS_PRESSURE
+    def native_value(self) -> float | None:
+        """Return the current battery level."""
+        return self._device.battery_level

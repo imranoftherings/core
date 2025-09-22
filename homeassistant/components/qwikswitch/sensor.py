@@ -1,30 +1,43 @@
 """Support for Qwikswitch Sensors."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 from pyqwikswitch.qwikswitch import SENSORS
 
-from homeassistant.core import callback
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import DOMAIN as QWIKSWITCH, QSEntity
+from . import DOMAIN
+from .entity import QSEntity
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup_platform(hass, _, add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    _: ConfigType,
+    add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Add sensor from the main Qwikswitch component."""
     if discovery_info is None:
         return
 
-    qsusb = hass.data[QWIKSWITCH]
+    qsusb = hass.data[DOMAIN]
     _LOGGER.debug("Setup qwikswitch.sensor %s, %s", qsusb, discovery_info)
-    devs = [QSSensor(sensor) for sensor in discovery_info[QWIKSWITCH]]
+    devs = [QSSensor(sensor) for sensor in discovery_info[DOMAIN]]
     add_entities(devs)
 
 
-class QSSensor(QSEntity):
+class QSSensor(QSEntity, SensorEntity):
     """Sensor based on a Qwikswitch relay/dimmer module."""
 
-    _val = None
+    _val: Any | None = None
 
     def __init__(self, sensor):
         """Initialize the sensor."""
@@ -35,9 +48,9 @@ class QSSensor(QSEntity):
 
         self._decode, self.unit = SENSORS[sensor_type]
         # this cannot happen because it only happens in bool and this should be redirected to binary_sensor
-        assert not isinstance(
-            self.unit, type
-        ), f"boolean sensor id={sensor['id']} name={sensor['name']}"
+        assert not isinstance(self.unit, type), (
+            f"boolean sensor id={sensor['id']} name={sensor['name']}"
+        )
 
     @callback
     def update_packet(self, packet):
@@ -56,9 +69,9 @@ class QSSensor(QSEntity):
             self.async_write_ha_state()
 
     @property
-    def state(self):
+    def native_value(self):
         """Return the value of the sensor."""
-        return str(self._val)
+        return None if self._val is None else str(self._val)
 
     @property
     def unique_id(self):
@@ -66,6 +79,6 @@ class QSSensor(QSEntity):
         return f"qs{self.qsid}:{self.channel}"
 
     @property
-    def unit_of_measurement(self):
+    def native_unit_of_measurement(self):
         """Return the unit the value is expressed in."""
         return self.unit

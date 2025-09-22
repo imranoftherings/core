@@ -1,40 +1,46 @@
 """Config flow for Omnilogic integration."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 from omnilogic import LoginException, OmniLogic, OmniLogicException
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers import aiohttp_client
 
-from .const import CONF_SCAN_INTERVAL, DOMAIN  # pylint:disable=unused-import
+from .const import CONF_SCAN_INTERVAL, DEFAULT_PH_OFFSET, DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class OmniLogicConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Omnilogic."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> OptionsFlowHandler:
         """Get the options flow for this handler."""
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle the initial step."""
-        errors = {}
-
-        config_entry = self.hass.config_entries.async_entries(DOMAIN)
-        if config_entry:
-            return self.async_abort(reason="single_instance_allowed")
-
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
             username = user_input[CONF_USERNAME]
@@ -49,7 +55,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
             except OmniLogicException:
                 errors["base"] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
@@ -69,14 +75,12 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OptionsFlow):
     """Handle Omnilogic client options."""
 
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage options."""
 
         if user_input is not None:
@@ -88,8 +92,16 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 {
                     vol.Optional(
                         CONF_SCAN_INTERVAL,
-                        default=6,
+                        default=self.config_entry.options.get(
+                            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+                        ),
                     ): int,
+                    vol.Optional(
+                        "ph_offset",
+                        default=self.config_entry.options.get(
+                            "ph_offset", DEFAULT_PH_OFFSET
+                        ),
+                    ): vol.All(vol.Coerce(float)),
                 }
             ),
         )

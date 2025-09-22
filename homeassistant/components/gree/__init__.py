@@ -1,72 +1,48 @@
 """The Gree Climate integration."""
-import asyncio
+
+from __future__ import annotations
+
+from datetime import timedelta
 import logging
 
-from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN
-from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.network import async_get_ipv4_broadcast_addresses
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 
-from .bridge import CannotConnect, DeviceDataUpdateCoordinator, DeviceHelper
-from .const import COORDINATOR, DOMAIN
+from .const import DISCOVERY_SCAN_INTERVAL
+from .coordinator import DiscoveryService, GreeConfigEntry, GreeRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
-
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Gree Climate component."""
-    hass.data[DOMAIN] = {}
-    return True
+PLATFORMS = [Platform.CLIMATE, Platform.SWITCH]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool:
     """Set up Gree Climate from a config entry."""
-    devices = []
+    gree_discovery = DiscoveryService(hass, entry)
+    entry.runtime_data = GreeRuntimeData(
+        discovery_service=gree_discovery, coordinators=[]
+    )
 
-    # First we'll grab as many devices as we can find on the network
-    # it's necessary to bind static devices anyway
+    async def _async_scan_update(_=None):
+        bcast_addr = list(await async_get_ipv4_broadcast_addresses(hass))
+        await gree_discovery.discovery.scan(0, bcast_ifaces=bcast_addr)
+
     _LOGGER.debug("Scanning network for Gree devices")
+    await _async_scan_update()
 
-    for device_info in await DeviceHelper.find_devices():
-        try:
-            device = await DeviceHelper.try_bind_device(device_info)
-        except CannotConnect:
-            _LOGGER.error("Unable to bind to gree device: %s", device_info)
-            continue
-
-        _LOGGER.debug(
-            "Adding Gree device at %s:%i (%s)",
-            device.device_info.ip,
-            device.device_info.port,
-            device.device_info.name,
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, _async_scan_update, timedelta(seconds=DISCOVERY_SCAN_INTERVAL)
         )
-        devices.append(device)
-
-    coordinators = [DeviceDataUpdateCoordinator(hass, d) for d in devices]
-    await asyncio.gather(*[x.async_refresh() for x in coordinators])
-
-    hass.data[DOMAIN][COORDINATOR] = coordinators
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, CLIMATE_DOMAIN)
     )
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, SWITCH_DOMAIN)
-    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: GreeConfigEntry) -> bool:
     """Unload a config entry."""
-    results = asyncio.gather(
-        hass.config_entries.async_forward_entry_unload(entry, CLIMATE_DOMAIN),
-        hass.config_entries.async_forward_entry_unload(entry, SWITCH_DOMAIN),
-    )
-
-    unload_ok = all(await results)
-    if unload_ok:
-        hass.data[DOMAIN].pop("devices", None)
-        hass.data[DOMAIN].pop(CLIMATE_DOMAIN, None)
-        hass.data[DOMAIN].pop(SWITCH_DOMAIN, None)
-
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

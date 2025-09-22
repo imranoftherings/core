@@ -1,17 +1,28 @@
 """Config flow for AlarmDecoder."""
+
+from __future__ import annotations
+
 import logging
+from typing import Any
 
 from adext import AdExt
 from alarmdecoder.devices import SerialDevice, SocketDevice
 from alarmdecoder.util import NoDeviceError
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.components.binary_sensor import DEVICE_CLASSES
+from homeassistant.components.binary_sensor import (
+    DEVICE_CLASSES_SCHEMA as BINARY_SENSOR_DEVICE_CLASSES_SCHEMA,
+)
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_PROTOCOL
 from homeassistant.core import callback
 
-from .const import (  # pylint: disable=unused-import
+from .const import (
     CONF_ALT_NIGHT_MODE,
     CONF_AUTO_BYPASS,
     CONF_CODE_ARM_REQUIRED,
@@ -45,23 +56,26 @@ EDIT_SETTINGS = "Arming Settings"
 _LOGGER = logging.getLogger(__name__)
 
 
-class AlarmDecoderFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class AlarmDecoderFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a AlarmDecoder config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_PUSH
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize AlarmDecoder ConfigFlow."""
         self.protocol = None
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> AlarmDecoderOptionsFlowHandler:
         """Get the options flow for AlarmDecoder."""
         return AlarmDecoderOptionsFlowHandler(config_entry)
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         if user_input is not None:
             self.protocol = user_input[CONF_PROTOCOL]
@@ -78,7 +92,9 @@ class AlarmDecoderFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             ),
         )
 
-    async def async_step_protocol(self, user_input=None):
+    async def async_step_protocol(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle AlarmDecoder protocol setup."""
         errors = {}
         if user_input is not None:
@@ -112,7 +128,7 @@ class AlarmDecoderFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             except NoDeviceError:
                 errors["base"] = "cannot_connect"
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 _LOGGER.exception("Unexpected exception during AlarmDecoder setup")
                 errors["base"] = "unknown"
 
@@ -138,18 +154,21 @@ class AlarmDecoderFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
+class AlarmDecoderOptionsFlowHandler(OptionsFlow):
     """Handle AlarmDecoder options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry):
+    selected_zone: str
+
+    def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize AlarmDecoder options flow."""
         self.arm_options = config_entry.options.get(OPTIONS_ARM, DEFAULT_ARM_OPTIONS)
         self.zone_options = config_entry.options.get(
             OPTIONS_ZONES, DEFAULT_ZONE_OPTIONS
         )
-        self.selected_zone = None
 
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             if user_input[EDIT_KEY] == EDIT_SETTINGS:
@@ -168,7 +187,9 @@ class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
             ),
         )
 
-    async def async_step_arm_settings(self, user_input=None):
+    async def async_step_arm_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Arming options form."""
         if user_input is not None:
             return self.async_create_entry(
@@ -195,7 +216,9 @@ class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
             ),
         )
 
-    async def async_step_zone_select(self, user_input=None):
+    async def async_step_zone_select(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Zone selection form."""
         errors = _validate_zone_input(user_input)
 
@@ -211,7 +234,9 @@ class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
             errors=errors,
         )
 
-    async def async_step_zone_details(self, user_input=None):
+    async def async_step_zone_details(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Zone details form."""
         errors = _validate_zone_input(user_input)
 
@@ -249,7 +274,7 @@ class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
                         default=existing_zone_settings.get(
                             CONF_ZONE_TYPE, DEFAULT_ZONE_TYPE
                         ),
-                    ): vol.In(DEVICE_CLASSES),
+                    ): BINARY_SENSOR_DEVICE_CLASSES_SCHEMA,
                     vol.Optional(
                         CONF_ZONE_RFID,
                         description={
@@ -288,7 +313,7 @@ class AlarmDecoderOptionsFlowHandler(config_entries.OptionsFlow):
         )
 
 
-def _validate_zone_input(zone_input):
+def _validate_zone_input(zone_input: dict[str, Any] | None) -> dict[str, str]:
     if not zone_input:
         return {}
     errors = {}
@@ -300,7 +325,7 @@ def _validate_zone_input(zone_input):
         errors["base"] = "relay_inclusive"
 
     # The following keys must be int
-    for key in [CONF_ZONE_NUMBER, CONF_ZONE_LOOP, CONF_RELAY_ADDR, CONF_RELAY_CHAN]:
+    for key in (CONF_ZONE_NUMBER, CONF_ZONE_LOOP, CONF_RELAY_ADDR, CONF_RELAY_CHAN):
         if key in zone_input:
             try:
                 int(zone_input[key])
@@ -322,21 +347,23 @@ def _validate_zone_input(zone_input):
     return errors
 
 
-def _fix_input_types(zone_input):
+def _fix_input_types(zone_input: dict[str, Any]) -> dict[str, Any]:
     """Convert necessary keys to int.
 
     Since ConfigFlow inputs of type int cannot default to an empty string, we collect the values below as
     strings and then convert them to ints.
     """
 
-    for key in [CONF_ZONE_LOOP, CONF_RELAY_ADDR, CONF_RELAY_CHAN]:
+    for key in (CONF_ZONE_LOOP, CONF_RELAY_ADDR, CONF_RELAY_CHAN):
         if key in zone_input:
             zone_input[key] = int(zone_input[key])
 
     return zone_input
 
 
-def _device_already_added(current_entries, user_input, protocol):
+def _device_already_added(
+    current_entries: list[ConfigEntry], user_input: dict[str, Any], protocol: str | None
+) -> bool:
     """Determine if entry has already been added to HA."""
     user_host = user_input.get(CONF_HOST)
     user_port = user_input.get(CONF_PORT)
@@ -349,12 +376,18 @@ def _device_already_added(current_entries, user_input, protocol):
         entry_path = entry.data.get(CONF_DEVICE_PATH)
         entry_baud = entry.data.get(CONF_DEVICE_BAUD)
 
-        if protocol == PROTOCOL_SOCKET:
-            if user_host == entry_host and user_port == entry_port:
-                return True
+        if (
+            protocol == PROTOCOL_SOCKET
+            and user_host == entry_host
+            and user_port == entry_port
+        ):
+            return True
 
-        if protocol == PROTOCOL_SERIAL:
-            if user_baud == entry_baud and user_path == entry_path:
-                return True
+        if (
+            protocol == PROTOCOL_SERIAL
+            and user_baud == entry_baud
+            and user_path == entry_path
+        ):
+            return True
 
     return False

@@ -2,12 +2,13 @@
 
 import logging
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import CONF_NAME, CONF_PIN
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import CONF_DIFFERENTIAL, CONF_PIN_MODE, DOMAIN
+from . import FirmataConfigEntry
+from .const import CONF_DIFFERENTIAL, CONF_PIN_MODE
 from .entity import FirmataPinEntity
 from .pin import FirmataAnalogInput, FirmataPinUsedException
 
@@ -15,12 +16,14 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities
+    hass: HomeAssistant,
+    config_entry: FirmataConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Firmata sensors."""
     new_entities = []
 
-    board = hass.data[DOMAIN][config_entry.entry_id]
+    board = config_entry.runtime_data
     for sensor in board.sensors:
         pin = sensor[CONF_PIN]
         pin_mode = sensor[CONF_PIN_MODE]
@@ -38,11 +41,10 @@ async def async_setup_entry(
         sensor_entity = FirmataSensor(api, config_entry, name, pin)
         new_entities.append(sensor_entity)
 
-    if new_entities:
-        async_add_entities(new_entities)
+    async_add_entities(new_entities)
 
 
-class FirmataSensor(FirmataPinEntity, Entity):
+class FirmataSensor(FirmataPinEntity, SensorEntity):
     """Representation of a sensor on a Firmata board."""
 
     async def async_added_to_hass(self) -> None:
@@ -54,6 +56,6 @@ class FirmataSensor(FirmataPinEntity, Entity):
         await self._api.stop_pin()
 
     @property
-    def state(self) -> int:
+    def native_value(self) -> int:
         """Return sensor state."""
         return self._api.state

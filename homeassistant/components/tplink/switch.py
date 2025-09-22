@@ -1,197 +1,135 @@
-"""Support for TPLink HS100/HS110/HS200 smart switch."""
-import asyncio
-import logging
-import time
+"""Support for TPLink switch entities."""
 
-from pyHS100 import SmartDeviceException, SmartPlug
+from __future__ import annotations
+
+from dataclasses import dataclass
+import logging
+from typing import Any, cast
+
+from kasa import Feature
 
 from homeassistant.components.switch import (
-    ATTR_CURRENT_POWER_W,
-    ATTR_TODAY_ENERGY_KWH,
+    DOMAIN as SWITCH_DOMAIN,
     SwitchEntity,
+    SwitchEntityDescription,
 )
-from homeassistant.const import ATTR_VOLTAGE
-from homeassistant.exceptions import PlatformNotReady
-import homeassistant.helpers.device_registry as dr
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from . import CONF_SWITCH, DOMAIN as TPLINK_DOMAIN
-from .common import add_available_devices
-
-PARALLEL_UPDATES = 0
+from . import TPLinkConfigEntry
+from .entity import (
+    CoordinatedTPLinkFeatureEntity,
+    TPLinkFeatureEntityDescription,
+    async_refresh_after,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_TOTAL_ENERGY_KWH = "total_energy_kwh"
-ATTR_CURRENT_A = "current_a"
 
-MAX_ATTEMPTS = 300
-SLEEP_TIME = 2
+@dataclass(frozen=True, kw_only=True)
+class TPLinkSwitchEntityDescription(
+    SwitchEntityDescription, TPLinkFeatureEntityDescription
+):
+    """Base class for a TPLink feature based switch entity description."""
 
 
-async def async_setup_entry(hass: HomeAssistantType, config_entry, async_add_entities):
+# Coordinator is used to centralize the data updates
+# For actions the integration handles locking of concurrent device request
+PARALLEL_UPDATES = 0
+
+SWITCH_DESCRIPTIONS: tuple[TPLinkSwitchEntityDescription, ...] = (
+    TPLinkSwitchEntityDescription(
+        key="state",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="led",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="auto_update_enabled",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="auto_off_enabled",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="smooth_transitions",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="fan_sleep_mode",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="child_lock",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="pir_enabled",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="motion_detection",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="person_detection",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="tamper_detection",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="baby_cry_detection",
+    ),
+    TPLinkSwitchEntityDescription(
+        key="carpet_boost",
+    ),
+)
+
+SWITCH_DESCRIPTIONS_MAP = {desc.key: desc for desc in SWITCH_DESCRIPTIONS}
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: TPLinkConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up switches."""
-    entities = await hass.async_add_executor_job(
-        add_available_devices, hass, CONF_SWITCH, SmartPlugSwitch
-    )
+    data = config_entry.runtime_data
+    parent_coordinator = data.parent_coordinator
+    device = parent_coordinator.device
+    known_child_device_ids: set[str] = set()
+    first_check = True
 
-    if entities:
-        async_add_entities(entities, update_before_add=True)
+    def _check_device() -> None:
+        entities = CoordinatedTPLinkFeatureEntity.entities_for_device_and_its_children(
+            hass=hass,
+            device=device,
+            coordinator=parent_coordinator,
+            feature_type=Feature.Switch,
+            entity_class=TPLinkSwitch,
+            descriptions=SWITCH_DESCRIPTIONS_MAP,
+            platform_domain=SWITCH_DOMAIN,
+            known_child_device_ids=known_child_device_ids,
+            first_check=first_check,
+        )
+        async_add_entities(entities)
 
-    if hass.data[TPLINK_DOMAIN][f"{CONF_SWITCH}_remaining"]:
-        raise PlatformNotReady
+    _check_device()
+    first_check = False
+    config_entry.async_on_unload(parent_coordinator.async_add_listener(_check_device))
 
 
-class SmartPlugSwitch(SwitchEntity):
-    """Representation of a TPLink Smart Plug switch."""
+class TPLinkSwitch(CoordinatedTPLinkFeatureEntity, SwitchEntity):
+    """Representation of a feature-based TPLink switch."""
 
-    def __init__(self, smartplug: SmartPlug):
-        """Initialize the switch."""
-        self.smartplug = smartplug
-        self._sysinfo = None
-        self._state = None
-        self._is_available = False
-        # Set up emeter cache
-        self._emeter_params = {}
+    entity_description: TPLinkSwitchEntityDescription
 
-        self._mac = None
-        self._alias = None
-        self._model = None
-        self._device_id = None
-        self._host = None
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return self._device_id
-
-    @property
-    def name(self):
-        """Return the name of the Smart Plug."""
-        return self._alias
-
-    @property
-    def device_info(self):
-        """Return information about the device."""
-        return {
-            "name": self._alias,
-            "model": self._model,
-            "manufacturer": "TP-Link",
-            "connections": {(dr.CONNECTION_NETWORK_MAC, self._mac)},
-            "sw_version": self._sysinfo["sw_ver"],
-        }
-
-    @property
-    def available(self) -> bool:
-        """Return if switch is available."""
-        return self._is_available
-
-    @property
-    def is_on(self):
-        """Return true if switch is on."""
-        return self._state
-
-    def turn_on(self, **kwargs):
+    @async_refresh_after
+    async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the switch on."""
-        self.smartplug.turn_on()
+        await self._feature.set_value(True)
 
-    def turn_off(self, **kwargs):
+    @async_refresh_after
+    async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the switch off."""
-        self.smartplug.turn_off()
+        await self._feature.set_value(False)
 
-    @property
-    def device_state_attributes(self):
-        """Return the state attributes of the device."""
-        return self._emeter_params
-
-    @property
-    def _plug_from_context(self):
-        """Return the plug from the context."""
-        children = self.smartplug.sys_info["children"]
-        return next(c for c in children if c["id"] == self.smartplug.context)
-
-    def update_state(self):
-        """Update the TP-Link switch's state."""
-        if self.smartplug.context is None:
-            self._state = self.smartplug.state == self.smartplug.SWITCH_STATE_ON
-        else:
-            self._state = self._plug_from_context["state"] == 1
-
-    def attempt_update(self, update_attempt):
-        """Attempt to get details from the TP-Link switch."""
-        try:
-            if not self._sysinfo:
-                self._sysinfo = self.smartplug.sys_info
-                self._mac = self._sysinfo["mac"]
-                self._model = self._sysinfo["model"]
-                self._host = self.smartplug.host
-                if self.smartplug.context is None:
-                    self._alias = self._sysinfo["alias"]
-                    self._device_id = self._mac
-                else:
-                    self._alias = self._plug_from_context["alias"]
-                    self._device_id = self.smartplug.context
-
-            self.update_state()
-
-            if self.smartplug.has_emeter:
-                emeter_readings = self.smartplug.get_emeter_realtime()
-
-                self._emeter_params[ATTR_CURRENT_POWER_W] = "{:.2f}".format(
-                    emeter_readings["power"]
-                )
-                self._emeter_params[ATTR_TOTAL_ENERGY_KWH] = "{:.3f}".format(
-                    emeter_readings["total"]
-                )
-                self._emeter_params[ATTR_VOLTAGE] = "{:.1f}".format(
-                    emeter_readings["voltage"]
-                )
-                self._emeter_params[ATTR_CURRENT_A] = "{:.2f}".format(
-                    emeter_readings["current"]
-                )
-
-                emeter_statics = self.smartplug.get_emeter_daily()
-                try:
-                    self._emeter_params[ATTR_TODAY_ENERGY_KWH] = "{:.3f}".format(
-                        emeter_statics[int(time.strftime("%e"))]
-                    )
-                except KeyError:
-                    # Device returned no daily history
-                    pass
-            return True
-        except (SmartDeviceException, OSError) as ex:
-            if update_attempt == 0:
-                _LOGGER.debug(
-                    "Retrying in %s seconds for %s|%s due to: %s",
-                    SLEEP_TIME,
-                    self._host,
-                    self._alias,
-                    ex,
-                )
-            return False
-
-    async def async_update(self):
-        """Update the TP-Link switch's state."""
-        for update_attempt in range(MAX_ATTEMPTS):
-            is_ready = await self.hass.async_add_executor_job(
-                self.attempt_update, update_attempt
-            )
-
-            if is_ready:
-                self._is_available = True
-                if update_attempt > 0:
-                    _LOGGER.debug(
-                        "Device %s|%s responded after %s attempts",
-                        self._host,
-                        self._alias,
-                        update_attempt,
-                    )
-                break
-            await asyncio.sleep(SLEEP_TIME)
-
-        else:
-            if self._is_available:
-                _LOGGER.warning(
-                    "Could not read state for %s|%s", self.smartplug.host, self._alias
-                )
-            self._is_available = False
+    @callback
+    def _async_update_attrs(self) -> bool:
+        """Update the entity's attributes."""
+        self._attr_is_on = cast(bool | None, self._feature.value)
+        return True

@@ -1,58 +1,59 @@
 """The Ondilo ICO integration."""
-import asyncio
 
+from homeassistant.components.application_credentials import (
+    ClientCredential,
+    async_import_client_credential,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers import config_entry_oauth2_flow, config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
-from . import api, config_flow
-from .const import DOMAIN
-from .oauth_impl import OndiloOauth2Implementation
+from .api import OndiloClient
+from .const import DOMAIN, OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET
+from .coordinator import OndiloIcoPoolsCoordinator
 
-PLATFORMS = ["sensor"]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+PLATFORMS = [Platform.SENSOR]
 
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Ondilo ICO component."""
-    hass.data.setdefault(DOMAIN, {})
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Ondilo ICO integration."""
+    # Import the default client credential.
+    await async_import_client_credential(
+        hass,
+        DOMAIN,
+        ClientCredential(OAUTH2_CLIENT_ID, OAUTH2_CLIENT_SECRET, name="Ondilo ICO"),
+    )
 
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Ondilo ICO from a config entry."""
-
-    config_flow.OAuth2FlowHandler.async_register_implementation(
-        hass,
-        OndiloOauth2Implementation(hass),
-    )
-
     implementation = (
         await config_entry_oauth2_flow.async_get_config_entry_implementation(
             hass, entry
         )
     )
 
-    hass.data[DOMAIN][entry.entry_id] = api.OndiloClient(hass, entry, implementation)
+    coordinator = OndiloIcoPoolsCoordinator(
+        hass, entry, OndiloClient(hass, entry, implementation)
+    )
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
 

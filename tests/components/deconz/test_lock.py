@@ -1,107 +1,138 @@
 """deCONZ lock platform tests."""
 
-from copy import deepcopy
-from unittest.mock import patch
+from collections.abc import Callable
 
-from homeassistant.components.deconz.const import DOMAIN as DECONZ_DOMAIN
-from homeassistant.components.deconz.gateway import get_gateway_from_config_entry
+import pytest
+
 from homeassistant.components.lock import (
     DOMAIN as LOCK_DOMAIN,
     SERVICE_LOCK,
     SERVICE_UNLOCK,
+    LockState,
 )
-from homeassistant.const import ATTR_ENTITY_ID, STATE_LOCKED, STATE_UNLOCKED
-from homeassistant.setup import async_setup_component
+from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.core import HomeAssistant
 
-from .test_gateway import DECONZ_WEB_REQUEST, setup_deconz_integration
+from .conftest import WebsocketDataType
 
-LOCKS = {
-    "1": {
-        "etag": "5c2ec06cde4bd654aef3a555fcd8ad12",
-        "hascolor": False,
-        "lastannounced": None,
-        "lastseen": "2020-08-22T15:29:03Z",
-        "manufacturername": "Danalock",
-        "modelid": "V3-BTZB",
-        "name": "Door lock",
-        "state": {"alert": "none", "on": False, "reachable": True},
-        "swversion": "19042019",
-        "type": "Door Lock",
-        "uniqueid": "00:00:00:00:00:00:00:00-00",
-    }
-}
+from tests.test_util.aiohttp import AiohttpClientMocker
 
 
-async def test_platform_manually_configured(hass):
-    """Test that we do not discover anything or try to set up a gateway."""
-    assert (
-        await async_setup_component(
-            hass, LOCK_DOMAIN, {"lock": {"platform": DECONZ_DOMAIN}}
-        )
-        is True
-    )
-    assert DECONZ_DOMAIN not in hass.data
-
-
-async def test_no_locks(hass):
-    """Test that no lock entities are created."""
-    await setup_deconz_integration(hass)
-    assert len(hass.states.async_all()) == 0
-
-
-async def test_locks(hass):
-    """Test that all supported lock entities are created."""
-    data = deepcopy(DECONZ_WEB_REQUEST)
-    data["lights"] = deepcopy(LOCKS)
-    config_entry = await setup_deconz_integration(hass, get_state_response=data)
-    gateway = get_gateway_from_config_entry(hass, config_entry)
-
+@pytest.mark.parametrize(
+    "light_payload",
+    [
+        {
+            "etag": "5c2ec06cde4bd654aef3a555fcd8ad12",
+            "hascolor": False,
+            "lastannounced": None,
+            "lastseen": "2020-08-22T15:29:03Z",
+            "manufacturername": "Danalock",
+            "modelid": "V3-BTZB",
+            "name": "Door lock",
+            "state": {"alert": "none", "on": False, "reachable": True},
+            "swversion": "19042019",
+            "type": "Door Lock",
+            "uniqueid": "00:00:00:00:00:00:00:00-00",
+        }
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_lock_from_light(
+    hass: HomeAssistant,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+    light_ws_data: WebsocketDataType,
+) -> None:
+    """Test that all supported lock entities based on lights are created."""
     assert len(hass.states.async_all()) == 1
-    assert hass.states.get("lock.door_lock").state == STATE_UNLOCKED
+    assert hass.states.get("lock.door_lock").state == LockState.UNLOCKED
 
-    door_lock = hass.states.get("lock.door_lock")
-    assert door_lock.state == STATE_UNLOCKED
-
-    state_changed_event = {
-        "t": "event",
-        "e": "changed",
-        "r": "lights",
-        "id": "1",
-        "state": {"on": True},
-    }
-    gateway.api.event_handler(state_changed_event)
-    await hass.async_block_till_done()
-
-    assert hass.states.get("lock.door_lock").state == STATE_LOCKED
+    await light_ws_data({"state": {"on": True}})
+    assert hass.states.get("lock.door_lock").state == LockState.LOCKED
 
     # Verify service calls
 
-    door_lock_device = gateway.api.lights["1"]
+    aioclient_mock = mock_put_request("/lights/0/state")
 
     # Service lock door
 
-    with patch.object(door_lock_device, "_request", return_value=True) as set_callback:
-        await hass.services.async_call(
-            LOCK_DOMAIN,
-            SERVICE_LOCK,
-            {ATTR_ENTITY_ID: "lock.door_lock"},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"on": True})
+    await hass.services.async_call(
+        LOCK_DOMAIN,
+        SERVICE_LOCK,
+        {ATTR_ENTITY_ID: "lock.door_lock"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"on": True}
 
     # Service unlock door
 
-    with patch.object(door_lock_device, "_request", return_value=True) as set_callback:
-        await hass.services.async_call(
-            LOCK_DOMAIN,
-            SERVICE_UNLOCK,
-            {ATTR_ENTITY_ID: "lock.door_lock"},
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-        set_callback.assert_called_with("put", "/lights/1/state", json={"on": False})
+    await hass.services.async_call(
+        LOCK_DOMAIN,
+        SERVICE_UNLOCK,
+        {ATTR_ENTITY_ID: "lock.door_lock"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[2][2] == {"on": False}
 
-    await hass.config_entries.async_unload(config_entry.entry_id)
 
-    assert len(hass.states.async_all()) == 0
+@pytest.mark.parametrize(
+    "sensor_payload",
+    [
+        {
+            "config": {
+                "battery": 100,
+                "lock": False,
+                "on": True,
+                "reachable": True,
+            },
+            "ep": 11,
+            "etag": "a43862f76b7fa48b0fbb9107df123b0e",
+            "lastseen": "2021-03-06T22:25Z",
+            "manufacturername": "Onesti Products AS",
+            "modelid": "easyCodeTouch_v1",
+            "name": "Door lock",
+            "state": {
+                "lastupdated": "2021-03-06T21:25:45.624",
+                "lockstate": "unlocked",
+            },
+            "swversion": "20201211",
+            "type": "ZHADoorLock",
+            "uniqueid": "00:00:00:00:00:00:00:00-00",
+        }
+    ],
+)
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_lock_from_sensor(
+    hass: HomeAssistant,
+    mock_put_request: Callable[[str, str], AiohttpClientMocker],
+    sensor_ws_data: WebsocketDataType,
+) -> None:
+    """Test that all supported lock entities based on sensors are created."""
+    assert len(hass.states.async_all()) == 2
+    assert hass.states.get("lock.door_lock").state == LockState.UNLOCKED
+
+    await sensor_ws_data({"state": {"lockstate": "locked"}})
+    assert hass.states.get("lock.door_lock").state == LockState.LOCKED
+
+    # Verify service calls
+
+    aioclient_mock = mock_put_request("/sensors/0/config")
+
+    # Service lock door
+
+    await hass.services.async_call(
+        LOCK_DOMAIN,
+        SERVICE_LOCK,
+        {ATTR_ENTITY_ID: "lock.door_lock"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[1][2] == {"lock": True}
+
+    # Service unlock door
+
+    await hass.services.async_call(
+        LOCK_DOMAIN,
+        SERVICE_UNLOCK,
+        {ATTR_ENTITY_ID: "lock.door_lock"},
+        blocking=True,
+    )
+    assert aioclient_mock.mock_calls[2][2] == {"lock": False}

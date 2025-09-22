@@ -1,62 +1,108 @@
 """The BSB-Lan integration."""
-from datetime import timedelta
 
-from bsblan import BSBLan, BSBLanConnectionError
+import dataclasses
 
-from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN
+from bsblan import (
+    BSBLAN,
+    BSBLANAuthError,
+    BSBLANConfig,
+    BSBLANConnectionError,
+    BSBLANError,
+    Device,
+    Info,
+    StaticState,
+)
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_USERNAME,
+    Platform,
+)
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryError,
+    ConfigEntryNotReady,
+)
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_PASSKEY, DATA_BSBLAN_CLIENT, DOMAIN
+from .const import CONF_PASSKEY, DOMAIN
+from .coordinator import BSBLanUpdateCoordinator
 
-SCAN_INTERVAL = timedelta(seconds=30)
+PLATFORMS = [Platform.CLIMATE, Platform.SENSOR, Platform.WATER_HEATER]
 
-
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the BSB-Lan component."""
-    return True
+type BSBLanConfigEntry = ConfigEntry[BSBLanData]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+@dataclasses.dataclass
+class BSBLanData:
+    """BSBLan data stored in the Home Assistant data object."""
+
+    coordinator: BSBLanUpdateCoordinator
+    client: BSBLAN
+    device: Device
+    info: Info
+    static: StaticState
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: BSBLanConfigEntry) -> bool:
     """Set up BSB-Lan from a config entry."""
 
-    session = async_get_clientsession(hass)
-    bsblan = BSBLan(
-        entry.data[CONF_HOST],
+    # create config using BSBLANConfig
+    config = BSBLANConfig(
+        host=entry.data[CONF_HOST],
         passkey=entry.data[CONF_PASSKEY],
         port=entry.data[CONF_PORT],
         username=entry.data.get(CONF_USERNAME),
         password=entry.data.get(CONF_PASSWORD),
-        session=session,
     )
+
+    # create BSBLAN client
+    session = async_get_clientsession(hass)
+    bsblan = BSBLAN(config, session)
+
+    # Create and perform first refresh of the coordinator
+    coordinator = BSBLanUpdateCoordinator(hass, entry, bsblan)
+    await coordinator.async_config_entry_first_refresh()
 
     try:
-        await bsblan.info()
-    except BSBLanConnectionError as exception:
-        raise ConfigEntryNotReady from exception
+        # Fetch all required data sequentially
+        device = await bsblan.device()
+        info = await bsblan.info()
+        static = await bsblan.static_values()
+    except BSBLANConnectionError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="setup_connection_error",
+            translation_placeholders={"host": entry.data[CONF_HOST]},
+        ) from err
+    except BSBLANAuthError as err:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="setup_auth_error",
+        ) from err
+    except BSBLANError as err:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="setup_general_error",
+        ) from err
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {DATA_BSBLAN_CLIENT: bsblan}
-
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, CLIMATE_DOMAIN)
+    entry.runtime_data = BSBLanData(
+        client=bsblan,
+        coordinator=coordinator,
+        device=device,
+        info=info,
+        static=static,
     )
 
-    return True
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload BSBLan config entry."""
-
-    await hass.config_entries.async_forward_entry_unload(entry, CLIMATE_DOMAIN)
-
-    # Cleanup
-    del hass.data[DOMAIN][entry.entry_id]
-    if not hass.data[DOMAIN]:
-        del hass.data[DOMAIN]
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: BSBLanConfigEntry) -> bool:
+    """Unload BSBLAN config entry."""
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
